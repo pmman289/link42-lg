@@ -1,0 +1,13 @@
+.venv/
+node_modules/
+dist/
+data/
+config/
+__pycache__/
+*.py[cod]
+*.sqlite3
+*.db
+.env
+.env.*
+npm-debug.log*
+.DS_Store
