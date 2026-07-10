@@ -1,6 +1,6 @@
 # Link42 Looking Glass
 
-Link42 Looking Glass 是一个面向 Link42 第三方 Looking Glass API 的前后端一体化 Web 应用。前端提供节点选择、路由查询、协议状态、协议详情和网络诊断界面；后端使用 FastAPI 代理第三方 API，避免 API Token 暴露在浏览器中。
+Link42 Looking Glass 是一个面向 Link42 第三方 Looking Glass API 的前后端一体化 Web 应用。前端提供节点选择、路由查询、协议状态、协议详情和网络诊断界面。
 
 ## 功能特性
 
@@ -211,7 +211,6 @@ docs/docker-hub-release.md
 
 ## 安全提示
 
-- 不要把 `data/looking-glass.sqlite3` 提交到 Git 仓库。
 - 生产环境务必修改 `LG_ADMIN_PASSWORD`。
 - 使用 HTTPS 和反向代理时建议设置 `LG_COOKIE_SECURE=true`。
 - API Token 只保存在后端 SQLite 中，浏览器不会直接访问 Link42 第三方 API。
