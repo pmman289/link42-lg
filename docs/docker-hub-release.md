@@ -160,7 +160,43 @@ docker compose up -d
 cp ./data/looking-glass.sqlite3 ./data/looking-glass.sqlite3.bak.$(date +%Y%m%d%H%M%S)
 ```
 
-## 8. 回滚
+## 8. HTTPS 反向代理 / CDN 注意事项
+
+镜像默认使用以下 Uvicorn 参数运行：
+
+```bash
+--proxy-headers --forwarded-allow-ips '*'
+```
+
+反向代理必须传递：
+
+```text
+Host
+X-Real-IP
+X-Forwarded-For
+X-Forwarded-Host
+X-Forwarded-Proto
+X-Forwarded-Port
+```
+
+Nginx location 示例：
+
+```nginx
+location / {
+    proxy_pass http://127.0.0.1:8000;
+    proxy_http_version 1.1;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Host $host;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_set_header X-Forwarded-Port 443;
+}
+```
+
+Cloudflare 必须使用 `Full` 或 `Full (strict)` SSL/TLS 模式。不要使用 `Flexible`，否则 CDN 到源站为 HTTP，而源站/反代强制 HTTPS 时会出现重定向循环。
+
+## 9. 回滚
 
 使用发布时的不可变版本标签：
 
@@ -175,7 +211,7 @@ Compose 中将镜像改为：
 image: pmman/link42-lg:<VERSION>
 ```
 
-## 9. 发布核对清单
+## 10. 发布核对清单
 
 - `npm run build` 通过。
 - `python -m py_compile backend/main.py` 通过。
@@ -185,3 +221,4 @@ image: pmman/link42-lg:<VERSION>
 - 运行时挂载了 `/app/config`。
 - 首次部署后已修改 `LG_ADMIN_PASSWORD`。
 - 生产 HTTPS 环境设置了 `LG_COOKIE_SECURE=true`。
+- CDN 使用 Full 或 Full strict HTTPS 模式。

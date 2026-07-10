@@ -94,6 +94,43 @@ docker run -d \
   pmman/link42-lg:latest
 ```
 
+## HTTPS 反向代理 / CDN
+
+容器镜像默认使用：
+
+```bash
+uvicorn backend.main:app --proxy-headers --forwarded-allow-ips='*'
+```
+
+反向代理必须传递 `X-Forwarded-*` 头，否则框架在处理自动 slash redirect 或静态资源 redirect 时可能生成错误的 `http://` 地址。
+
+Nginx 示例：
+
+```nginx
+server {
+    listen 443 ssl http2;
+    server_name lg.example.com;
+
+    location / {
+        proxy_pass http://127.0.0.1:8000;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Host $host;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header X-Forwarded-Port 443;
+    }
+}
+```
+
+如使用 Cloudflare：
+
+- SSL/TLS mode 使用 `Full` 或 `Full (strict)`。
+- 不要使用 `Flexible`，否则 CDN 到源站使用 HTTP，而源站/反代又强制 HTTPS 时会产生重定向循环。
+- HTTPS 生产环境建议设置 `LG_COOKIE_SECURE=true`。
+- 如果源站反代也做 HTTP 到 HTTPS 跳转，确认 CDN 到源站也走 HTTPS。
+
 ## 持久化目录
 
 容器内需要持久化：
