@@ -503,7 +503,7 @@ function parseBirdRoutes(stdout = "") {
   let lastPrefix = "";
 
   for (const line of lines) {
-    const routeMatch = line.match(/^\s*(?:(\S+)\s+)?unicast\s+\[([^\]]+)\]\s*(\*)?\s*([A-Z])?\s*\(([^)]*)\)\s*(?:\[([^\]]*)\])?/);
+    const routeMatch = line.match(/^\s*(?:(\S+)\s+)?unicast\s+\[([^\]]+)\]\s*(\*)?\s*(\S+)?\s*\(([^)]*)\)\s*(?:\[([^\]]*)\])?/);
     if (routeMatch) {
       const [, prefix, sourceRaw, selectedMark, flag, preference, routeId] = routeMatch;
       const sourceMatch = sourceRaw.match(/^(\S+)(?:\s+(.+?))?(?:\s+from\s+(.+))?$/);
