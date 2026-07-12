@@ -1,6 +1,7 @@
 # Link42 Looking Glass
 
 Link42 Looking Glass 是一个面向 Link42 第三方 Looking Glass API 的前后端一体化 Web 应用。前端提供节点选择、路由查询、协议状态、协议详情和网络诊断界面。
+演示站点：https://lg.pmman.tech
 
 ## 功能特性
 
