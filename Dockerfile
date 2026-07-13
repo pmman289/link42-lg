@@ -26,14 +26,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY backend ./backend
 COPY --from=frontend-build /app/dist ./dist
 
-RUN groupadd --gid 10001 link42 \
-    && useradd --uid 10001 --gid link42 --no-create-home --shell /usr/sbin/nologin link42 \
-    && mkdir -p /app/data /app/config \
-    && chown -R link42:link42 /app
+RUN mkdir -p /app/data /app/config
 
 VOLUME ["/app/data", "/app/config"]
 EXPOSE 8000
-
-USER 10001:10001
 
 CMD ["uvicorn", "backend.main:app", "--host", "0.0.0.0", "--port", "8000", "--proxy-headers"]

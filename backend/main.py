@@ -1,6 +1,7 @@
 import asyncio
 import hashlib
 import json
+import logging
 import os
 import ipaddress
 import re
@@ -44,16 +45,15 @@ DOMAIN_RE = re.compile(
 PROTOCOL_NAME_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.:-]{0,63}$")
 RESOURCE_ID_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.:-]{0,127}$")
 COOKIE_TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{20,128}$")
+LOGGER = logging.getLogger("uvicorn.error")
 
 
 def load_admin_password() -> str:
     password = os.getenv("LG_ADMIN_PASSWORD")
     if password is None:
-        raise RuntimeError("LG_ADMIN_PASSWORD is required and must be at least 12 characters")
-    if len(password) < 12 or len(password) > 256 or len(set(password)) < 6:
-        raise RuntimeError("LG_ADMIN_PASSWORD must be 12-256 characters and sufficiently varied")
-    if password.lower() in {"link42", "password", "change-me", "changeme", "admin123456"}:
-        raise RuntimeError("LG_ADMIN_PASSWORD must not be a common default password")
+        raise RuntimeError("LG_ADMIN_PASSWORD is required and must be at least 8 characters")
+    if len(password) < 8 or len(password) > 256:
+        raise RuntimeError("LG_ADMIN_PASSWORD must be 8-256 characters")
     return password
 
 
@@ -248,22 +248,36 @@ def normalize_api_base(value: str) -> str:
     if not trimmed:
         return ""
     parsed = urlsplit(trimmed)
-    if parsed.scheme.lower() != "https":
-        raise ValueError("API Base must use HTTPS")
+    scheme = parsed.scheme.lower()
+    if scheme not in {"http", "https"}:
+        raise ValueError("API Base must use HTTP or HTTPS")
     if not parsed.hostname or parsed.username or parsed.password or parsed.query or parsed.fragment:
-        raise ValueError("API Base must be an HTTPS origin without credentials, query, or fragment")
+        raise ValueError("API Base must be an HTTP(S) origin without credentials, query, or fragment")
     try:
         port = parsed.port
     except ValueError as exc:
         raise ValueError("API Base has an invalid port") from exc
     host = parsed.hostname.encode("idna").decode("ascii").lower().rstrip(".")
     netloc = f"[{host}]" if ":" in host else host
-    if port and port != 443:
+    default_port = 443 if scheme == "https" else 80
+    if port and port != default_port:
         netloc = f"{netloc}:{port}"
     path = parsed.path.rstrip("/")
     if path and path != API_PATH:
         raise ValueError(f"API Base path must be empty or {API_PATH}")
-    return urlunsplit(("https", netloc, API_PATH, "", ""))
+    return urlunsplit((scheme, netloc, API_PATH, "", ""))
+
+
+def warn_if_insecure_api_base(value: str) -> None:
+    try:
+        parsed = urlsplit(normalize_api_base(value))
+    except ValueError:
+        return
+    if parsed.scheme == "http":
+        LOGGER.warning(
+            "Looking Glass API Base for host %s uses unencrypted HTTP; the Bearer Token will be sent in plaintext",
+            parsed.hostname,
+        )
 
 
 def api_host_is_allowed(host: str) -> bool:
@@ -293,15 +307,12 @@ async def validate_api_base(value: str, *, allow_empty: bool = False) -> str:
     if not api_host_is_allowed(host):
         raise HTTPException(status_code=400, detail={"code": "api_host_not_allowed", "message": "API Base host is not trusted"})
     try:
-        addresses = await asyncio.to_thread(socket.getaddrinfo, host, parsed.port or 443, type=socket.SOCK_STREAM)
+        default_port = 443 if parsed.scheme == "https" else 80
+        addresses = await asyncio.to_thread(socket.getaddrinfo, host, parsed.port or default_port, type=socket.SOCK_STREAM)
     except socket.gaierror as exc:
         raise HTTPException(status_code=400, detail={"code": "api_host_unresolvable", "message": "API Base host could not be resolved"}) from exc
-    resolved = {item[4][0] for item in addresses}
-    if not resolved or any(not ipaddress.ip_address(address).is_global for address in resolved):
-        raise HTTPException(
-            status_code=400,
-            detail={"code": "unsafe_api_host", "message": "API Base must resolve only to public IP addresses"},
-        )
+    if not addresses:
+        raise HTTPException(status_code=400, detail={"code": "api_host_unresolvable", "message": "API Base host could not be resolved"})
     return normalized
 
 
@@ -733,6 +744,7 @@ RATE_LIMITER = FixedWindowRateLimiter()
 
 
 init_db()
+warn_if_insecure_api_base(get_settings()["apiBase"])
 app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
 app.add_middleware(RequestBodyLimitMiddleware, max_bytes=MAX_REQUEST_BODY_BYTES)
 
@@ -869,6 +881,7 @@ async def update_admin_settings(body: SettingsBody, lg_admin_session: str | None
         "nodeOverrides": clean_node_overrides(body.nodeOverrides),
         "publicProtocols": clean_public_protocols(body.publicProtocols),
     }
+    warn_if_insecure_api_base(api_base)
     save_settings(next_settings)
     return admin_settings(next_settings)
 

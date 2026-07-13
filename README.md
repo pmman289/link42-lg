@@ -38,7 +38,6 @@ pmman/link42-lg
 
 ```bash
 mkdir -p link42-lg/data link42-lg/config
-chown -R 10001:10001 link42-lg/data link42-lg/config
 cd link42-lg
 ```
 
@@ -79,7 +78,7 @@ http://127.0.0.1:8000
 
 首次部署后点击右上角登录，使用 `LG_ADMIN_PASSWORD` 设置的管理员密码进入管理页，然后配置：
 
-- API 地址，例如 `https://link42.example.com`
+- API 地址，例如 `https://link42.example.com` 或内网的 `http://172.20.0.10:8000`
 - Looking Glass API Token
 - 公开节点
 - 节点名称、图标和公开协议隐藏列表
@@ -154,6 +153,8 @@ server {
 /app/data/looking-glass.sqlite3
 ```
 
+容器默认以 root 用户运行，因此绑定宿主机目录时不需要额外调整为固定 UID/GID。
+
 升级前建议备份数据库：
 
 ```bash
@@ -164,7 +165,7 @@ cp ./data/looking-glass.sqlite3 ./data/looking-glass.sqlite3.bak.$(date +%Y%m%d%
 
 | 变量 | 默认值 | 说明 |
 | --- | --- | --- |
-| `LG_ADMIN_PASSWORD` | 无 | 必填；长度 12-256 且不能使用简单、重复的内容，缺失时服务拒绝启动 |
+| `LG_ADMIN_PASSWORD` | 无 | 必填；长度 8-256，缺失或不足 8 位时服务拒绝启动 |
 | `LG_COOKIE_SECURE` | `auto` | 根据请求协议设置 Secure Cookie；可设为 `true` 或 `false` |
 | `LG_API_ALLOWED_HOSTS` | 空 | API Base 域名白名单，逗号分隔，支持 `*.example.com`；未配置时首次保存的域名会被锁定，之后不能在管理页换域名 |
 | `LG_MAX_REQUEST_BODY_BYTES` | `1048576` | API 请求体大小上限 |
@@ -178,7 +179,11 @@ cp ./data/looking-glass.sqlite3 ./data/looking-glass.sqlite3.bak.$(date +%Y%m%d%
 
 `LG_API_BASE` 和 `LG_API_TOKEN` 只在首次初始化数据库时作为默认值写入。数据库已经存在后，请在管理页修改配置。
 
-API Base 始终要求 HTTPS 且只能解析到公网地址。建议部署时显式设置 `LG_API_ALLOWED_HOSTS`；未设置时，已有数据库中的 API 域名或首次在管理页保存的域名会作为固定可信域名。API 来源发生变化时，旧 Token 会自动清除，必须显式填写新 Token。
+API Base 支持 HTTP 和 HTTPS，也允许解析到私网、回环及 DN42 地址。使用 HTTP 时，应用会在启动和保存配置时输出明文传输警告。建议公网部署优先使用 HTTPS，并显式设置 `LG_API_ALLOWED_HOSTS`；未设置时，已有数据库中的 API 域名或首次在管理页保存的域名会作为固定可信域名。API 来源发生变化时，旧 Token 会自动清除，必须显式填写新 Token。
+
+使用私网 IP 作为 API Base 且配置了 `LG_API_ALLOWED_HOSTS` 时，需要将该 IP 加入白名单；也可以在首次配置时不设置白名单，让应用锁定首次保存的主机。
+
+路由查询、ping 和 traceroute 均允许私网及 DN42 IPv4/IPv6 地址；ping 和 traceroute 同时允许内部域名。
 
 ## 本地开发
 
@@ -227,7 +232,7 @@ docs/docker-hub-release.md
 ## 安全提示
 
 - 必须设置强随机 `LG_ADMIN_PASSWORD`，未设置时应用不会启动。
-- API Base 仅允许 HTTPS 且必须解析到公网地址；生产环境建议同时配置 `LG_API_ALLOWED_HOSTS`。
+- API Base 使用 HTTP 时 Token 会明文传输；公网部署应优先使用 HTTPS，生产环境建议同时配置 `LG_API_ALLOWED_HOSTS`。
 - 使用 HTTPS 和反向代理时保持 `LG_COOKIE_SECURE=auto`，并准确配置 `FORWARDED_ALLOW_IPS`。
 - API Token 只保存在后端 SQLite 中，浏览器不会直接访问 Link42 第三方 API。
 
