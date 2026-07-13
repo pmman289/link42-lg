@@ -38,6 +38,7 @@ pmman/link42-lg
 
 ```bash
 mkdir -p link42-lg/data link42-lg/config
+chown -R 10001:10001 link42-lg/data link42-lg/config
 cd link42-lg
 ```
 
@@ -50,10 +51,11 @@ services:
     container_name: link42-lg
     restart: unless-stopped
     ports:
-      - "8000:8000"
+      - "127.0.0.1:8000:8000"
     environment:
-      LG_ADMIN_PASSWORD: "change-me"
-      LG_COOKIE_SECURE: "true"
+      LG_ADMIN_PASSWORD: "replace-with-a-long-random-password"
+      LG_COOKIE_SECURE: "auto"
+      LG_API_ALLOWED_HOSTS: "link42.example.com"
       LG_NODE_CONCURRENCY_LIMIT: "2"
       LG_DATA_DIR: "/app/data"
       LG_CONFIG_DIR: "/app/config"
@@ -88,9 +90,10 @@ http://127.0.0.1:8000
 docker run -d \
   --name link42-lg \
   --restart unless-stopped \
-  -p 8000:8000 \
-  -e LG_ADMIN_PASSWORD='change-me' \
-  -e LG_COOKIE_SECURE='true' \
+  -p 127.0.0.1:8000:8000 \
+  -e LG_ADMIN_PASSWORD='replace-with-a-long-random-password' \
+  -e LG_COOKIE_SECURE='auto' \
+  -e LG_API_ALLOWED_HOSTS='link42.example.com' \
   -e LG_NODE_CONCURRENCY_LIMIT='2' \
   -v "$PWD/data:/app/data" \
   -v "$PWD/config:/app/config" \
@@ -102,10 +105,12 @@ docker run -d \
 容器镜像默认使用：
 
 ```bash
-uvicorn backend.main:app --proxy-headers --forwarded-allow-ips='*'
+uvicorn backend.main:app --proxy-headers
 ```
 
 反向代理必须传递 `X-Forwarded-*` 头，否则框架在处理自动 slash redirect 或静态资源 redirect 时可能生成错误的 `http://` 地址。
+
+镜像默认只信任来自 `127.0.0.1` 的转发头。反向代理不在同一网络命名空间时，通过 `FORWARDED_ALLOW_IPS` 设置反向代理的准确 IP 或专用容器网段，并确保 8000 端口不直接暴露到公网。例如 `FORWARDED_ALLOW_IPS=172.30.0.0/24`。不要设置为 `*`。
 
 Nginx 示例：
 
@@ -131,7 +136,7 @@ server {
 
 - SSL/TLS mode 使用 `Full` 或 `Full (strict)`。
 - 不要使用 `Flexible`，否则 CDN 到源站使用 HTTP，而源站/反代又强制 HTTPS 时会产生重定向循环。
-- HTTPS 生产环境建议设置 `LG_COOKIE_SECURE=true`。
+- `LG_COOKIE_SECURE=auto` 会根据可信代理传入的协议自动启用 Secure Cookie，也可强制设为 `true`。
 - 如果源站反代也做 HTTP 到 HTTPS 跳转，确认 CDN 到源站也走 HTTPS。
 
 ## 持久化目录
@@ -159,16 +164,21 @@ cp ./data/looking-glass.sqlite3 ./data/looking-glass.sqlite3.bak.$(date +%Y%m%d%
 
 | 变量 | 默认值 | 说明 |
 | --- | --- | --- |
-| `LG_ADMIN_PASSWORD` | `link42` | 管理员登录密码，生产环境必须修改 |
-| `LG_COOKIE_SECURE` | 空 | HTTPS 环境建议设置为 `true` |
+| `LG_ADMIN_PASSWORD` | 无 | 必填；长度 12-256 且不能使用简单、重复的内容，缺失时服务拒绝启动 |
+| `LG_COOKIE_SECURE` | `auto` | 根据请求协议设置 Secure Cookie；可设为 `true` 或 `false` |
+| `LG_API_ALLOWED_HOSTS` | 空 | API Base 域名白名单，逗号分隔，支持 `*.example.com`；未配置时首次保存的域名会被锁定，之后不能在管理页换域名 |
+| `LG_MAX_REQUEST_BODY_BYTES` | `1048576` | API 请求体大小上限 |
 | `LG_NODE_CONCURRENCY_LIMIT` | `2` | 单节点并发查询限制 |
 | `LG_DATA_DIR` | `./data` | 数据目录，容器默认 `/app/data` |
 | `LG_CONFIG_DIR` | `./config` | 配置目录，容器默认 `/app/config` |
 | `LG_DB_PATH` | `$LG_DATA_DIR/looking-glass.sqlite3` | SQLite 数据库路径 |
 | `LG_API_BASE` | 空 | 首次初始化数据库时写入的 API 地址 |
 | `LG_API_TOKEN` | 空 | 首次初始化数据库时写入的 API Token |
+| `FORWARDED_ALLOW_IPS` | `127.0.0.1` | Uvicorn 信任的反向代理 IP 或网段，逗号分隔 |
 
 `LG_API_BASE` 和 `LG_API_TOKEN` 只在首次初始化数据库时作为默认值写入。数据库已经存在后，请在管理页修改配置。
+
+API Base 始终要求 HTTPS 且只能解析到公网地址。建议部署时显式设置 `LG_API_ALLOWED_HOSTS`；未设置时，已有数据库中的 API 域名或首次在管理页保存的域名会作为固定可信域名。API 来源发生变化时，旧 Token 会自动清除，必须显式填写新 Token。
 
 ## 本地开发
 
@@ -190,6 +200,7 @@ pip install -r requirements.txt
 
 ```bash
 npm run dev
+export LG_ADMIN_PASSWORD='local-development-password'
 npm run backend
 ```
 
@@ -197,6 +208,7 @@ npm run backend
 
 ```bash
 npm run build
+export LG_ADMIN_PASSWORD='local-development-password'
 npm run start
 ```
 
@@ -214,8 +226,9 @@ docs/docker-hub-release.md
 
 ## 安全提示
 
-- 生产环境务必修改 `LG_ADMIN_PASSWORD`。
-- 使用 HTTPS 和反向代理时建议设置 `LG_COOKIE_SECURE=true`。
+- 必须设置强随机 `LG_ADMIN_PASSWORD`，未设置时应用不会启动。
+- API Base 仅允许 HTTPS 且必须解析到公网地址；生产环境建议同时配置 `LG_API_ALLOWED_HOSTS`。
+- 使用 HTTPS 和反向代理时保持 `LG_COOKIE_SECURE=auto`，并准确配置 `FORWARDED_ALLOW_IPS`。
 - API Token 只保存在后端 SQLite 中，浏览器不会直接访问 Link42 第三方 API。
 
 ## License

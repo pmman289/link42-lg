@@ -34,14 +34,17 @@ LG_DB_PATH=/app/data/looking-glass.sqlite3
 常用运行环境变量：
 
 ```text
-LG_ADMIN_PASSWORD=change-me
-LG_COOKIE_SECURE=true
+LG_ADMIN_PASSWORD=replace-with-a-long-random-password
+LG_COOKIE_SECURE=auto
+LG_API_ALLOWED_HOSTS=link42.example.com
 LG_NODE_CONCURRENCY_LIMIT=2
 LG_API_BASE=https://link42.example.com
 LG_API_TOKEN=l42lg_xxx_xxx
 ```
 
 `LG_API_BASE` 和 `LG_API_TOKEN` 只在首次初始化数据库时写入默认设置；后续以管理页和 SQLite 中的配置为准。
+
+`LG_API_ALLOWED_HOSTS` 用于固定 API Base 的可信域名，支持逗号分隔和 `*.example.com`。未设置时首次保存的 API 域名会被锁定，后续更换域名需要先配置白名单。API 来源变化时应用会清除旧 Token。
 
 ## 2. 构建前检查
 
@@ -103,11 +106,14 @@ docker buildx build \
 ## 5. 本地运行验收
 
 ```bash
+mkdir -p "$PWD/runtime/data" "$PWD/runtime/config"
+chown -R 10001:10001 "$PWD/runtime/data" "$PWD/runtime/config"
 docker run --rm \
   --name link42-lg \
-  -p 8000:8000 \
-  -e LG_ADMIN_PASSWORD='change-me' \
+  -p 127.0.0.1:8000:8000 \
+  -e LG_ADMIN_PASSWORD='replace-with-a-long-random-password' \
   -e LG_COOKIE_SECURE=false \
+  -e LG_API_ALLOWED_HOSTS='link42.example.com' \
   -v "$PWD/runtime/data:/app/data" \
   -v "$PWD/runtime/config:/app/config" \
   pmman/link42-lg:latest
@@ -134,10 +140,11 @@ services:
     container_name: link42-lg
     restart: unless-stopped
     ports:
-      - "8000:8000"
+      - "127.0.0.1:8000:8000"
     environment:
-      LG_ADMIN_PASSWORD: "change-me"
-      LG_COOKIE_SECURE: "true"
+      LG_ADMIN_PASSWORD: "replace-with-a-long-random-password"
+      LG_COOKIE_SECURE: "auto"
+      LG_API_ALLOWED_HOSTS: "link42.example.com"
       LG_NODE_CONCURRENCY_LIMIT: "2"
       LG_DATA_DIR: "/app/data"
       LG_CONFIG_DIR: "/app/config"
@@ -145,6 +152,13 @@ services:
     volumes:
       - ./data:/app/data
       - ./config:/app/config
+```
+
+启动 Compose 前创建挂载目录并设置容器用户权限：
+
+```bash
+mkdir -p data config
+chown -R 10001:10001 data config
 ```
 
 ## 7. 升级
@@ -162,11 +176,13 @@ cp ./data/looking-glass.sqlite3 ./data/looking-glass.sqlite3.bak.$(date +%Y%m%d%
 
 ## 8. HTTPS 反向代理 / CDN 注意事项
 
-镜像默认使用以下 Uvicorn 参数运行：
+镜像默认使用以下 Uvicorn 参数运行，并只信任 `127.0.0.1` 的转发头：
 
 ```bash
---proxy-headers --forwarded-allow-ips '*'
+--proxy-headers
 ```
+
+反向代理位于其他容器或主机时，设置 `FORWARDED_ALLOW_IPS` 为代理的准确 IP 或专用网段，例如 `172.30.0.0/24`。应用端口必须只允许该反向代理访问，不能在信任容器网段的同时将端口直接暴露到公网。禁止使用 `FORWARDED_ALLOW_IPS=*`。
 
 反向代理必须传递：
 
@@ -219,6 +235,9 @@ image: pmman/link42-lg:<VERSION>
 - Docker 镜像成功推送 `pmman/link42-lg:latest`。
 - 运行时挂载了 `/app/data`。
 - 运行时挂载了 `/app/config`。
-- 首次部署后已修改 `LG_ADMIN_PASSWORD`。
-- 生产 HTTPS 环境设置了 `LG_COOKIE_SECURE=true`。
+- 已设置长度至少 12 位的强随机 `LG_ADMIN_PASSWORD`。
+- 已将数据和配置目录权限设置为容器 UID/GID `10001:10001`。
+- 生产环境已配置 `LG_API_ALLOWED_HOSTS`。
+- 生产 HTTPS 环境保持 `LG_COOKIE_SECURE=auto` 或设置为 `true`。
+- `FORWARDED_ALLOW_IPS` 只包含实际反向代理地址，且未使用 `*`。
 - CDN 使用 Full 或 Full strict HTTPS 模式。
