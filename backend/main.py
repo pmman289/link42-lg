@@ -42,6 +42,7 @@ API_ALLOWED_HOSTS = {
     if host.strip()
 }
 LOCAL_QUERY_DEADLINE_SECONDS = 90
+LOCAL_DEADLINE_CLOCK_SKEW_SECONDS = 5
 TERMINAL_QUERY_STATUSES = {"succeeded", "failed", "expired", "cancelled"}
 DOMAIN_RE = re.compile(
     r"^(?=.{1,253}$)(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)*[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$"
@@ -617,6 +618,24 @@ def filter_protocol_stdout(stdout: str, blocked_protocols: set[str]) -> str:
     return "\n".join(filtered) + ("\n" if stdout.endswith("\n") and filtered else "")
 
 
+def filter_protocol_result(result: dict[str, Any], blocked_protocols: set[str]) -> dict[str, Any]:
+    filtered = dict(result)
+    if isinstance(filtered.get("stdout"), str):
+        filtered["stdout"] = filter_protocol_stdout(filtered["stdout"], blocked_protocols)
+    for key in ("protocols", "items", "entries"):
+        values = filtered.get(key)
+        if not isinstance(values, list):
+            continue
+        filtered[key] = [
+            entry
+            for entry in values
+            if not isinstance(entry, dict)
+            or str(entry.get("name") or entry.get("protocol_name") or entry.get("protocol") or "").split(None, 1)[0]
+            not in blocked_protocols
+        ]
+    return filtered
+
+
 def filter_route_stdout(stdout: str, blocked_protocols: set[str]) -> str:
     if not stdout or not blocked_protocols:
         return stdout
@@ -655,7 +674,7 @@ def filter_route_result(result: dict[str, Any], blocked_protocols: set[str]) -> 
             entry
             for entry in values
             if not isinstance(entry, dict)
-            or str(entry.get("protocol") or entry.get("protocol_name") or entry.get("source") or "").split(None, 1)[0]
+            or str(entry.get("protocol_name") or entry.get("source") or entry.get("name") or entry.get("protocol") or "").split(None, 1)[0]
             not in blocked_protocols
         ]
     return filtered
@@ -671,15 +690,13 @@ def sanitize_query_payload(payload: dict[str, Any], settings: dict[str, Any], ad
         protocol_name = str((payload.get("request") or {}).get("protocol_name") or "")
         if protocol_name in blocked:
             raise HTTPException(status_code=404, detail={"code": "query_not_found", "message": "Query not found"})
-    if operation == "bird.protocols":
-        result = payload.get("result")
-        if isinstance(result, dict) and isinstance(result.get("stdout"), str):
-            payload = {**payload, "result": {**result, "stdout": filter_protocol_stdout(result["stdout"], blocked)}}
     result = payload.get("result")
-    if isinstance(result, dict) and isinstance(result.get("stdout"), str):
-        stdout = result["stdout"]
-        looks_like_routes = BIRD_ROUTE_HEADER_RE.search(stdout) is not None
-        if operation in {"bird.route_lookup", "bird.routes_by_origin_as"} or looks_like_routes:
+    if isinstance(result, dict):
+        if operation == "bird.protocols":
+            payload = {**payload, "result": filter_protocol_result(result, blocked)}
+        elif operation in {"bird.route_lookup", "bird.routes_by_origin_as"}:
+            payload = {**payload, "result": filter_route_result(result, blocked)}
+        elif isinstance(result.get("stdout"), str) and BIRD_ROUTE_HEADER_RE.search(result["stdout"]):
             payload = {**payload, "result": filter_route_result(result, blocked)}
     return payload
 
@@ -782,6 +799,7 @@ def acquire_node_slot(node_ref: str, owner_hash: str | None) -> str:
             db.rollback()
             raise HTTPException(
                 status_code=429,
+                headers={"Retry-After": "2"},
                 detail={"code": "query_queue_full", "message": "Node query concurrency limit reached"},
             )
         if owner_hash:
@@ -814,8 +832,17 @@ def acquire_node_slot(node_ref: str, owner_hash: str | None) -> str:
 
 def bind_node_slot(slot_id: str, query_id: str, deadline_at: int | None) -> None:
     now = int(time.time())
-    upstream_deadline = int(deadline_at) if isinstance(deadline_at, (int, float)) else now + LOCAL_QUERY_DEADLINE_SECONDS
-    deadline = min(max(upstream_deadline, now + 1), now + LOCAL_QUERY_DEADLINE_SECONDS)
+    fallback_deadline = now + LOCAL_QUERY_DEADLINE_SECONDS
+    upstream_deadline = None
+    if isinstance(deadline_at, (int, float)) and not isinstance(deadline_at, bool):
+        try:
+            upstream_deadline = int(deadline_at)
+        except (OverflowError, ValueError):
+            upstream_deadline = None
+    if upstream_deadline is None or upstream_deadline <= now + LOCAL_DEADLINE_CLOCK_SKEW_SECONDS:
+        deadline = fallback_deadline
+    else:
+        deadline = min(upstream_deadline, fallback_deadline)
     with connect_db() as db:
         db.execute(
             "update query_slots set query_id = ?, deadline_at = ? where slot_id = ?",
@@ -1074,6 +1101,8 @@ async def update_admin_settings(body: SettingsBody, lg_admin_session: str | None
     pinned_host = current.get("pinnedApiHost") or current_host
     if api_base and pinned_host and next_host != pinned_host and not API_ALLOWED_HOSTS:
         raise HTTPException(status_code=400, detail={"code": "api_host_not_allowed", "message": "Changing the API host requires LG_API_ALLOWED_HOSTS to include the new host"})
+    if api_base and pinned_host and next_host != pinned_host and API_ALLOWED_HOSTS:
+        pinned_host = next_host
     source_changed = api_base != current_api_base
     token = ""
     if body.clearApiToken:

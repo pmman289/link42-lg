@@ -128,6 +128,9 @@ const copy = {
     clearTokenConfirm: "确定清除当前 API Token 吗？",
     rateLimited: "请求过于频繁，请稍后重试",
     queryFailed: "查询失败",
+    queryExpired: "查询已过期，请重试",
+    queryCancelled: "查询已取消，请重试",
+    queryDeadlineExceeded: "查询超时，请重试",
     copyFailed: "复制失败，请检查浏览器权限",
     selectAll: "全选",
     clearAll: "清空",
@@ -294,6 +297,9 @@ const copy = {
     clearTokenConfirm: "Clear the current API Token?",
     rateLimited: "Too many requests. Please try again later.",
     queryFailed: "Query failed",
+    queryExpired: "Query expired, please retry",
+    queryCancelled: "Query cancelled, please retry",
+    queryDeadlineExceeded: "Query timed out, please retry",
     copyFailed: "Copy failed. Check browser permissions.",
     selectAll: "Select all",
     clearAll: "Clear",
@@ -474,11 +480,12 @@ function validateIp(value) {
   const ipv4 = /^(25[0-5]|2[0-4]\d|1?\d?\d)(\.(25[0-5]|2[0-4]\d|1?\d?\d)){3}$/.test(trimmed);
   if (ipv4) return true;
   if (!trimmed.includes(":")) return false;
-  const pieces = trimmed.split("::");
-  if (pieces.length > 2) return false;
-  const groups = trimmed.replace("::", ":").split(":").filter(Boolean);
-  if (groups.some((group) => !/^[0-9a-fA-F]{1,4}$/.test(group))) return false;
-  return pieces.length === 2 ? groups.length < 8 : groups.length === 8;
+  try {
+    const parsed = new URL(`http://[${trimmed}]/`);
+    return parsed.hostname.startsWith("[") && parsed.hostname.endsWith("]");
+  } catch {
+    return false;
+  }
 }
 
 function validateTarget(value) {
@@ -534,6 +541,17 @@ function waitForDelay(delayMs, signal) {
 
 function isAbortError(error) {
   return error?.name === "AbortError";
+}
+
+function isQueryFailure(query) {
+  return !query || ["failed", "expired", "cancelled"].includes(query.status);
+}
+
+function queryFailureMessage(query, labels, fallback) {
+  if (query?.error?.message) return query.error.message;
+  if (query?.status === "expired") return labels.queryExpired;
+  if (query?.status === "cancelled") return labels.queryCancelled;
+  return fallback;
 }
 
 function replaceAbortController(ref) {
@@ -1162,7 +1180,7 @@ export default function App() {
       const retryAfter = Number(response.headers.get("Retry-After"));
       delay = Number.isFinite(retryAfter) && retryAfter > 0 ? retryAfter * 1000 : Math.min(delay + 1000, 2000);
       if (Date.now() > localDeadline) {
-        throw new Error("Query deadline exceeded");
+        throw new Error(t.queryDeadlineExceeded);
       }
     }
   }
@@ -1180,7 +1198,7 @@ export default function App() {
       const retryAfter = Number(response.headers.get("Retry-After"));
       delay = Number.isFinite(retryAfter) && retryAfter > 0 ? retryAfter * 1000 : Math.min(delay + 1000, 2000);
       if (Date.now() > localDeadline) {
-        throw new Error("Query deadline exceeded");
+        throw new Error(t.queryDeadlineExceeded);
       }
     }
   }
@@ -1226,8 +1244,8 @@ export default function App() {
         controller.signal,
       );
       if (controller.signal.aborted) return;
-      if (!finalQuery || finalQuery.status === "failed") {
-        throw new Error(finalQuery?.error?.message || t.queryFailed);
+      if (isQueryFailure(finalQuery)) {
+        throw new Error(queryFailureMessage(finalQuery, t, t.queryFailed));
       }
     } catch (error) {
       if (isAbortError(error) || generation !== protocolGeneration.current) return;
@@ -1265,7 +1283,7 @@ export default function App() {
         controller.signal,
       );
       if (controller.signal.aborted) return;
-      if (!finalQuery || finalQuery.status === "failed") throw new Error(finalQuery?.error?.message || "Protocol query failed");
+      if (isQueryFailure(finalQuery)) throw new Error(queryFailureMessage(finalQuery, t, t.queryFailed));
       const options = parseBirdProtocols(finalQuery?.result?.stdout || "");
       setSettingsProtocolOptions((current) => ({ ...current, [nodeRef]: options }));
       setSettingsProtocolStatus((current) => ({ ...current, [nodeRef]: finalQuery.status }));
@@ -1318,7 +1336,7 @@ export default function App() {
         controller.signal,
       );
       if (controller.signal.aborted) return;
-      if (!finalQuery || finalQuery.status === "failed") throw new Error(finalQuery?.error?.message || "Protocol detail query failed");
+      if (isQueryFailure(finalQuery)) throw new Error(queryFailureMessage(finalQuery, t, t.queryFailed));
       const parsed = parseBirdProtocolDetail(finalQuery?.result?.stdout || "", protocol);
       setProtocolDetailPage({ node: selectedNode, protocol, query: finalQuery, parsed });
       setPage("protocol");
@@ -1379,8 +1397,8 @@ export default function App() {
         controller.signal,
       );
       if (controller.signal.aborted) return;
-      if (!finalQuery || finalQuery.status === "failed") {
-        throw new Error(finalQuery?.error?.message || t.queryFailed);
+      if (isQueryFailure(finalQuery)) {
+        throw new Error(queryFailureMessage(finalQuery, t, t.queryFailed));
       }
     } catch (error) {
       if (isAbortError(error) || originGeneration.current !== generation) return;
@@ -1467,8 +1485,8 @@ export default function App() {
       setQueryStatus(json.status);
       const retryAfter = Number(response.headers.get("Retry-After"));
       const finalQuery = await pollQuery(json.query_id, Number.isFinite(retryAfter) && retryAfter > 0 ? retryAfter * 1000 : 500, generation, controller.signal);
-      if (finalQuery?.status === "failed") {
-        setQueryError(finalQuery.error?.message || t.queryFailed);
+      if (isQueryFailure(finalQuery)) {
+        setQueryError(queryFailureMessage(finalQuery, t, t.queryFailed));
       }
     } catch (error) {
       if (isAbortError(error) || generation !== queryGeneration.current) return;
