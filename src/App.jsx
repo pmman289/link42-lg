@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import {
   AlertCircle,
   ArrowLeft,
@@ -123,6 +123,12 @@ const copy = {
     unknownRegion: "未知地域",
     saveSettings: "保存设置",
     saved: "已保存设置",
+    saveFailed: "保存失败，请检查配置后重试",
+    clearToken: "清除 Token",
+    clearTokenConfirm: "确定清除当前 API Token 吗？",
+    rateLimited: "请求过于频繁，请稍后重试",
+    queryFailed: "查询失败",
+    copyFailed: "复制失败，请检查浏览器权限",
     selectAll: "全选",
     clearAll: "清空",
     nodes: "节点",
@@ -283,6 +289,12 @@ const copy = {
     unknownRegion: "Unknown region",
     saveSettings: "Save settings",
     saved: "Settings saved",
+    saveFailed: "Save failed. Check the configuration and try again.",
+    clearToken: "Clear Token",
+    clearTokenConfirm: "Clear the current API Token?",
+    rateLimited: "Too many requests. Please try again later.",
+    queryFailed: "Query failed",
+    copyFailed: "Copy failed. Check browser permissions.",
     selectAll: "Select all",
     clearAll: "Clear",
     nodes: "Nodes",
@@ -458,10 +470,15 @@ function formatTime(value, locale) {
 
 function validateIp(value) {
   const trimmed = value.trim();
-  const ipv4 =
-    /^(25[0-5]|2[0-4]\d|1?\d?\d)(\.(25[0-5]|2[0-4]\d|1?\d?\d)){3}$/.test(trimmed);
-  const ipv6 = trimmed.includes(":") && /^[0-9a-fA-F:.]+$/.test(trimmed) && trimmed.length >= 3;
-  return ipv4 || ipv6;
+  if (!trimmed || trimmed.includes("/")) return false;
+  const ipv4 = /^(25[0-5]|2[0-4]\d|1?\d?\d)(\.(25[0-5]|2[0-4]\d|1?\d?\d)){3}$/.test(trimmed);
+  if (ipv4) return true;
+  if (!trimmed.includes(":")) return false;
+  const pieces = trimmed.split("::");
+  if (pieces.length > 2) return false;
+  const groups = trimmed.replace("::", ":").split(":").filter(Boolean);
+  if (groups.some((group) => !/^[0-9a-fA-F]{1,4}$/.test(group))) return false;
+  return pieces.length === 2 ? groups.length < 8 : groups.length === 8;
 }
 
 function validateTarget(value) {
@@ -489,6 +506,8 @@ async function apiFetch(path, options = {}) {
     const detail = json?.detail || json?.error;
     const message = detail?.message || json?.error?.message || response.statusText || "Request failed";
     const error = new Error(message);
+    error.status = response.status;
+    error.retryAfter = response.headers.get("Retry-After");
     error.code = detail?.code || json?.error?.code;
     throw error;
   }
@@ -804,6 +823,9 @@ export default function App() {
   const [loginPassword, setLoginPassword] = useState("");
   const [loginError, setLoginError] = useState("");
   const [settingsSaved, setSettingsSaved] = useState(false);
+  const [settingsError, setSettingsError] = useState("");
+  const [settingsSaving, setSettingsSaving] = useState(false);
+  const [tokenClearRequested, setTokenClearRequested] = useState(false);
   const [showToken, setShowToken] = useState(false);
   const [nodes, setNodes] = useState([]);
   const [activeNodeRef, setActiveNodeRef] = useState("");
@@ -821,6 +843,10 @@ export default function App() {
   const [query, setQuery] = useState(null);
   const [queryStatus, setQueryStatus] = useState("ready");
   const [queryError, setQueryError] = useState("");
+  const queryGeneration = useRef(0);
+  const protocolGeneration = useRef(0);
+  const detailGeneration = useRef(0);
+  const originGeneration = useRef(0);
   const [protocolQuery, setProtocolQuery] = useState(null);
   const [protocolStatus, setProtocolStatus] = useState("ready");
   const [protocolError, setProtocolError] = useState("");
@@ -918,8 +944,21 @@ export default function App() {
     setNodesLoading(true);
     setNodesError("");
     try {
-      const { json } = await apiFetch("/api/nodes?limit=100");
-      const items = Array.isArray(json.items) ? json.items : [];
+      const items = [];
+      const seen = new Set();
+      let cursor = "";
+      for (let page = 0; page < 20; page += 1) {
+        const { json } = await apiFetch(`/api/nodes?limit=100${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ""}`);
+        for (const item of Array.isArray(json.items) ? json.items : []) {
+          if (item?.node_ref && !seen.has(item.node_ref)) {
+            seen.add(item.node_ref);
+            items.push(item);
+          }
+        }
+        const nextCursor = typeof json.next_cursor === "string" ? json.next_cursor : "";
+        if (!nextCursor || nextCursor === cursor || items.length >= 2000) break;
+        cursor = nextCursor;
+      }
       setNodes(items);
     } catch (error) {
       setNodesError(error.message);
@@ -983,6 +1022,10 @@ export default function App() {
   }, [activeNodeRef, filteredNodes]);
 
   function selectNode(nodeRef) {
+    queryGeneration.current += 1;
+    protocolGeneration.current += 1;
+    detailGeneration.current += 1;
+    originGeneration.current += 1;
     setActiveNodeRef(nodeRef);
     setSidebarOpen(false);
     setQuery(null);
@@ -1003,6 +1046,7 @@ export default function App() {
   }
 
   function selectOperation(nextOperation) {
+    queryGeneration.current += 1;
     setOperation(nextOperation);
     setQuery(null);
     setQueryStatus("ready");
@@ -1010,12 +1054,14 @@ export default function App() {
     setProtocolDetailPage(null);
   }
 
-  async function pollQuery(queryId, firstDelayMs = 500) {
+  async function pollQuery(queryId, firstDelayMs = 500, generation = queryGeneration.current) {
     let delay = firstDelayMs;
     const localDeadline = Date.now() + 90000;
     while (true) {
       await new Promise((resolve) => window.setTimeout(resolve, delay));
+      if (generation !== queryGeneration.current) return null;
       const { json, response } = await apiFetch(`/api/queries/${queryId}`);
+      if (generation !== queryGeneration.current) return null;
       setQuery(json);
       setQueryStatus(json.status);
       if (!["queued", "running"].includes(json.status)) return json;
@@ -1027,12 +1073,14 @@ export default function App() {
     }
   }
 
-  async function pollDetachedQuery(queryId, firstDelayMs, onUpdate) {
+  async function pollDetachedQuery(queryId, firstDelayMs, onUpdate, generationRef = null, generation = null) {
     let delay = firstDelayMs;
     const localDeadline = Date.now() + 90000;
     while (true) {
       await new Promise((resolve) => window.setTimeout(resolve, delay));
+      if (generationRef && generation !== generationRef.current) return null;
       const { json, response } = await apiFetch(`/api/queries/${queryId}`);
+      if (generationRef && generation !== generationRef.current) return null;
       onUpdate(json);
       if (!["queued", "running"].includes(json.status)) return json;
       const retryAfter = Number(response.headers.get("Retry-After"));
@@ -1043,8 +1091,10 @@ export default function App() {
     }
   }
 
-  async function loadProtocols(nodeOverride = activeNode) {
-    const selectedNode = nodeOverride;
+  async function loadProtocols(nodeOverride) {
+    const generation = protocolGeneration.current + 1;
+    protocolGeneration.current = generation;
+    const selectedNode = nodeOverride || activeNode;
     setProtocolError("");
     setProtocolDetailQuery(null);
     setProtocolDetailStatus("ready");
@@ -1065,17 +1115,23 @@ export default function App() {
       setProtocolQuery(json);
       setProtocolStatus(json.status);
       const retryAfter = Number(response.headers.get("Retry-After"));
-      await pollDetachedQuery(
+      const finalQuery = await pollDetachedQuery(
         json.query_id,
         Number.isFinite(retryAfter) && retryAfter > 0 ? retryAfter * 1000 : 500,
         (next) => {
           setProtocolQuery(next);
           setProtocolStatus(next.status);
         },
+        protocolGeneration,
+        generation,
       );
+      if (!finalQuery || finalQuery.status === "failed") {
+        throw new Error(finalQuery?.error?.message || t.queryFailed);
+      }
     } catch (error) {
+      if (generation !== protocolGeneration.current) return;
       setProtocolStatus("failed");
-      setProtocolError(error.message);
+      setProtocolError(error.status === 429 ? t.rateLimited : error.message);
     }
   }
 
@@ -1096,6 +1152,7 @@ export default function App() {
         Number.isFinite(retryAfter) && retryAfter > 0 ? retryAfter * 1000 : 500,
         (next) => setSettingsProtocolStatus((current) => ({ ...current, [nodeRef]: next.status })),
       );
+      if (!finalQuery || finalQuery.status === "failed") throw new Error(finalQuery?.error?.message || "Protocol query failed");
       const options = parseBirdProtocols(finalQuery?.result?.stdout || "");
       setSettingsProtocolOptions((current) => ({ ...current, [nodeRef]: options }));
       setSettingsProtocolStatus((current) => ({ ...current, [nodeRef]: finalQuery.status }));
@@ -1118,6 +1175,8 @@ export default function App() {
       setProtocolError(t.offlineBlocked);
       return;
     }
+    const generation = detailGeneration.current + 1;
+    detailGeneration.current = generation;
     try {
       setProtocolDetailStatus("queued");
       setProtocolDetailQuery(null);
@@ -1135,13 +1194,17 @@ export default function App() {
           setProtocolDetailQuery(next);
           setProtocolDetailStatus(next.status);
         },
+        detailGeneration,
+        generation,
       );
+      if (!finalQuery || finalQuery.status === "failed") throw new Error(finalQuery?.error?.message || "Protocol detail query failed");
       const parsed = parseBirdProtocolDetail(finalQuery?.result?.stdout || "", protocol);
       setProtocolDetailPage({ node: selectedNode, protocol, query: finalQuery, parsed });
       setPage("protocol");
     } catch (error) {
+      if (detailGeneration.current !== generation) return;
       setProtocolDetailStatus("failed");
-      setProtocolError(error.message);
+      setProtocolError(error.status === 429 ? t.rateLimited : error.message);
     }
   }
 
@@ -1167,6 +1230,8 @@ export default function App() {
       return;
     }
 
+    const generation = originGeneration.current + 1;
+    originGeneration.current = generation;
     try {
       setOriginRoutesStatus("queued");
       const { json, response } = await apiFetch(`/api/nodes/${node.node_ref}/bird/routes:lookup-origin-as`, {
@@ -1176,17 +1241,23 @@ export default function App() {
       setOriginRoutesQuery(json);
       setOriginRoutesStatus(json.status);
       const retryAfter = Number(response.headers.get("Retry-After"));
-      await pollDetachedQuery(
+      const finalQuery = await pollDetachedQuery(
         json.query_id,
         Number.isFinite(retryAfter) && retryAfter > 0 ? retryAfter * 1000 : 500,
         (next) => {
           setOriginRoutesQuery(next);
           setOriginRoutesStatus(next.status);
         },
+        originGeneration,
+        generation,
       );
+      if (!finalQuery || finalQuery.status === "failed") {
+        throw new Error(finalQuery?.error?.message || t.queryFailed);
+      }
     } catch (error) {
+      if (originGeneration.current !== generation) return;
       setOriginRoutesStatus("failed");
-      setOriginRoutesError(error.message);
+      setOriginRoutesError(error.status === 429 ? t.rateLimited : error.message);
     }
   }
 
@@ -1251,6 +1322,8 @@ export default function App() {
     }[operation];
 
     try {
+      const generation = queryGeneration.current + 1;
+      queryGeneration.current = generation;
       setQuery(null);
       setQueryStatus("queued");
       const { json, response } = await apiFetch(queryConfig.path, {
@@ -1260,10 +1333,13 @@ export default function App() {
       setQuery(json);
       setQueryStatus(json.status);
       const retryAfter = Number(response.headers.get("Retry-After"));
-      await pollQuery(json.query_id, Number.isFinite(retryAfter) && retryAfter > 0 ? retryAfter * 1000 : 500);
+      const finalQuery = await pollQuery(json.query_id, Number.isFinite(retryAfter) && retryAfter > 0 ? retryAfter * 1000 : 500, generation);
+      if (finalQuery?.status === "failed") {
+        setQueryError(finalQuery.error?.message || t.queryFailed);
+      }
     } catch (error) {
       setQueryStatus("failed");
-      setQueryError(error.message);
+      setQueryError(error.status === 429 ? t.rateLimited : error.message);
     }
   }
 
@@ -1279,8 +1355,8 @@ export default function App() {
       setPage("admin");
       setLoginPassword("");
       setLoginError("");
-    } catch {
-      setLoginError(t.loginFailed);
+    } catch (error) {
+      setLoginError(error.status === 429 ? `${t.rateLimited}${error.retryAfter ? ` (${error.retryAfter}s)` : ""}` : t.loginFailed);
     }
   }
 
@@ -1340,29 +1416,50 @@ export default function App() {
 
   async function saveSettings(event) {
     event.preventDefault();
+    if (settingsSaving) return;
+    setSettingsError("");
+    setSettingsSaved(false);
+    setSettingsSaving(true);
     const payload = {
       title: draftSettings.title.trim() || "Link42 Looking Glass",
       apiBase: draftSettings.apiBase.trim(),
       apiToken: draftSettings.apiToken.trim(),
+      clearApiToken: tokenClearRequested,
       publicNodeRefs: draftSettings.publicNodeRefs,
       nodeOverrides: draftSettings.nodeOverrides || {},
       publicProtocols: draftSettings.publicProtocols || {},
     };
-    const { json } = await apiFetch("/api/admin/settings", {
-      method: "PUT",
-      body: JSON.stringify(payload),
-    });
-    const next = { ...defaultSettings, ...json, configured: Boolean(json.apiBase && json.apiTokenSet) };
-    setSettings(next);
-    setDraftSettings({ ...next, apiToken: "" });
-    setSettingsSaved(true);
-    window.setTimeout(() => setSettingsSaved(false), 1600);
+    try {
+      const { json } = await apiFetch("/api/admin/settings", {
+        method: "PUT",
+        body: JSON.stringify(payload),
+      });
+      const next = { ...defaultSettings, ...json, configured: Boolean(json.apiBase && json.apiTokenSet) };
+      setSettings(next);
+      setDraftSettings({ ...next, apiToken: "" });
+      setTokenClearRequested(false);
+      setSettingsSaved(true);
+      window.setTimeout(() => setSettingsSaved(false), 1600);
+    } catch (error) {
+      setSettingsError(error.status === 429 ? t.rateLimited : error.message || t.saveFailed);
+    } finally {
+      setSettingsSaving(false);
+    }
   }
 
   async function copyOutput() {
     const result = query?.result;
     const text = [result?.command, result?.stdout, result?.stderr].filter(Boolean).join("\n\n");
-    await navigator.clipboard?.writeText(text);
+    if (!navigator.clipboard?.writeText) {
+      setQueryError(t.copyFailed);
+      return;
+    }
+    try {
+      await navigator.clipboard.writeText(text);
+    } catch {
+      setQueryError(t.copyFailed);
+      return;
+    }
     setCopied(true);
     window.setTimeout(() => setCopied(false), 1400);
   }
@@ -1497,6 +1594,18 @@ export default function App() {
                   </button>
                 </div>
                 {draftSettings.apiTokenPreview && <small className="field-hint">{draftSettings.apiTokenPreview}</small>}
+                {draftSettings.apiTokenSet && (
+                  <button
+                    type="button"
+                    className="text-icon-button danger-action"
+                    onClick={() => {
+                      if (window.confirm(t.clearTokenConfirm)) setTokenClearRequested(true);
+                    }}
+                  >
+                    <X size={14} />
+                    <span>{tokenClearRequested ? t.clearAll : t.clearToken}</span>
+                  </button>
+                )}
               </label>
               <div className="public-node-box">
                 <div className="public-node-head">
@@ -1523,6 +1632,11 @@ export default function App() {
                     const icon = normalizeFlagCode(override.icon ?? node.icon ?? "");
                     const hiddenProtocols = draftSettings.publicProtocols?.[node.node_ref] || [];
                     const protocolOptions = settingsProtocolOptions[node.node_ref] || [];
+                    const protocolNames = new Set(protocolOptions.map((protocol) => protocol.name));
+                    const hiddenOnlyProtocols = hiddenProtocols
+                      .filter((name) => !protocolNames.has(name))
+                      .map((name) => ({ name, proto: "", state: "not currently reported" }));
+                    const displayedProtocolOptions = [...protocolOptions, ...hiddenOnlyProtocols];
                     const protocolPickerStatus = settingsProtocolStatus[node.node_ref] || "ready";
                     const protocolPickerLoading = ["queued", "running"].includes(protocolPickerStatus);
                     const canLoadProtocolChoices = node.online && node.capabilities?.bird_protocols;
@@ -1597,9 +1711,9 @@ export default function App() {
                               </div>
                             )}
                             {settingsProtocolError[node.node_ref] && <small className="field-error">{settingsProtocolError[node.node_ref]}</small>}
-                            {protocolOptions.length ? (
+                            {displayedProtocolOptions.length ? (
                               <div className="protocol-choice-list">
-                                {protocolOptions.map((protocol) => (
+                                {displayedProtocolOptions.map((protocol) => (
                                   <label className="protocol-choice" key={protocol.name}>
                                     <input
                                       type="checkbox"
@@ -1623,10 +1737,11 @@ export default function App() {
                   })}
                 </div>
               </div>
+              {settingsError && <p role="alert" className="form-error">{settingsError}</p>}
               <p className="security-note">{t.frontendSecurityHint}</p>
-              <button className="save-button" type="submit">
-                <Save size={15} />
-                {t.saveSettings}
+              <button className="save-button" type="submit" disabled={settingsSaving}>
+                {settingsSaving ? <Loader2 className="spin" size={15} /> : <Save size={15} />}
+                {settingsSaving ? t.running : t.saveSettings}
               </button>
             </form>
           </section>
@@ -1634,7 +1749,7 @@ export default function App() {
       ) : page === "protocol" && protocolDetailPage ? (
         <main className="protocol-page">
           <div className="protocol-page-actions">
-            <button className="back-button" type="button" onClick={() => setPage("lg")}>
+            <button className="back-button" type="button" onClick={() => { detailGeneration.current += 1; setPage("lg"); }}>
               <ArrowLeft size={16} />
               <span>{t.backToLookingGlass}</span>
             </button>
@@ -1903,7 +2018,7 @@ export default function App() {
                   <button
                     className="text-icon-button"
                     type="button"
-                    onClick={loadProtocols}
+                    onClick={() => loadProtocols(activeNode)}
                     disabled={!activeNode?.online || !activeNode?.capabilities?.bird_protocols || ["queued", "running"].includes(protocolStatus)}
                   >
                     {["queued", "running"].includes(protocolStatus) ? <Loader2 className="spin" size={15} /> : <RefreshCw size={15} />}
@@ -2028,7 +2143,7 @@ export default function App() {
                   </span>
                 </form>
 
-                {queryError && <div className="form-error">{queryError}</div>}
+                {queryError && <div role="alert" className="form-error">{queryError}</div>}
               </section>
             </>
           ) : (
@@ -2072,7 +2187,7 @@ export default function App() {
                   </div>
                   <Server size={15} />
                 </div>
-                <pre>{result?.stdout || result?.stderr || queryError || t.noOutput}</pre>
+                <pre>{result?.stdout || result?.stderr || query?.error?.message || queryError || t.noOutput}</pre>
               </div>
 
               {result?.stderr && result.stdout && (
@@ -2129,6 +2244,7 @@ export default function App() {
                 className="modal-close"
                 type="button"
                 onClick={() => {
+                  originGeneration.current += 1;
                   setOriginRoutesOpen(false);
                   setOriginRoutesError("");
                 }}

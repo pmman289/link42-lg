@@ -10,9 +10,10 @@ import socket
 import sqlite3
 import threading
 import time
+from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import urlencode, urlsplit, urlunsplit
 
 import httpx
 from fastapi import Cookie, FastAPI, HTTPException, Request, Response
@@ -32,6 +33,9 @@ SESSION_TTL_SECONDS = 60 * 60 * 12
 COOKIE_SECURE_MODE = os.getenv("LG_COOKIE_SECURE", "auto").strip().lower()
 NODE_CONCURRENCY_LIMIT = max(1, int(os.getenv("LG_NODE_CONCURRENCY_LIMIT", "2")))
 MAX_REQUEST_BODY_BYTES = max(1024, int(os.getenv("LG_MAX_REQUEST_BODY_BYTES", str(1024 * 1024))))
+MAX_NODE_PAGES = max(1, int(os.getenv("LG_MAX_NODE_PAGES", "20")))
+MAX_PUBLIC_NODES = max(1, int(os.getenv("LG_MAX_PUBLIC_NODES", "2000")))
+PER_CLIENT_NODE_CONCURRENCY_LIMIT = max(1, int(os.getenv("LG_PER_CLIENT_NODE_CONCURRENCY_LIMIT", "1")))
 API_ALLOWED_HOSTS = {
     host.strip().lower().rstrip(".")
     for host in os.getenv("LG_API_ALLOWED_HOSTS", "").split(",")
@@ -46,6 +50,14 @@ PROTOCOL_NAME_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.:-]{0,63}$")
 RESOURCE_ID_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.:-]{0,127}$")
 COOKIE_TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{20,128}$")
 LOGGER = logging.getLogger("uvicorn.error")
+UPSTREAM_CLIENT: httpx.AsyncClient | None = None
+ASN_CLIENT: httpx.AsyncClient | None = None
+UPSTREAM_CLIENT_LOOP: asyncio.AbstractEventLoop | None = None
+ASN_CLIENT_LOOP: asyncio.AbstractEventLoop | None = None
+ASN_CACHE: dict[str, tuple[float, str]] = {}
+ASN_CACHE_LOCK = threading.Lock()
+ASN_LOOKUP_SEMAPHORE: asyncio.Semaphore | None = None
+ASN_SEMAPHORE_LOOP: asyncio.AbstractEventLoop | None = None
 
 
 def load_admin_password() -> str:
@@ -72,6 +84,13 @@ class SettingsBody(BaseModel):
     publicNodeRefs: list[str] = Field(default_factory=list, max_length=500)
     nodeOverrides: dict[str, dict[str, str]] = Field(default_factory=dict)
     publicProtocols: dict[str, list[str]] = Field(default_factory=dict)
+
+    @field_validator("apiToken")
+    @classmethod
+    def validate_api_token(cls, value: str | None) -> str | None:
+        if value is not None and any(char in value for char in "\r\n"):
+            raise ValueError("apiToken must not contain line breaks")
+        return value
 
 
 class RouteLookupBody(BaseModel):
@@ -129,9 +148,49 @@ def connect() -> sqlite3.Connection:
     return db
 
 
+@contextmanager
+def connect_db() -> Any:
+    db = connect()
+    try:
+        yield db
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
+
+
+def get_upstream_client() -> httpx.AsyncClient:
+    global UPSTREAM_CLIENT, UPSTREAM_CLIENT_LOOP
+    loop = asyncio.get_running_loop()
+    if UPSTREAM_CLIENT is None or UPSTREAM_CLIENT.is_closed or UPSTREAM_CLIENT_LOOP is not loop:
+        UPSTREAM_CLIENT = httpx.AsyncClient(timeout=httpx.Timeout(25.0, connect=5.0), follow_redirects=False)
+        UPSTREAM_CLIENT_LOOP = loop
+    return UPSTREAM_CLIENT
+
+
+def get_asn_client() -> httpx.AsyncClient:
+    global ASN_CLIENT, ASN_CLIENT_LOOP
+    loop = asyncio.get_running_loop()
+    if ASN_CLIENT is None or ASN_CLIENT.is_closed or ASN_CLIENT_LOOP is not loop:
+        ASN_CLIENT = httpx.AsyncClient(timeout=httpx.Timeout(10.0, connect=3.0), follow_redirects=False)
+        ASN_CLIENT_LOOP = loop
+    return ASN_CLIENT
+
+
+def get_asn_semaphore() -> asyncio.Semaphore:
+    global ASN_LOOKUP_SEMAPHORE, ASN_SEMAPHORE_LOOP
+    loop = asyncio.get_running_loop()
+    if ASN_LOOKUP_SEMAPHORE is None or ASN_SEMAPHORE_LOOP is not loop:
+        ASN_LOOKUP_SEMAPHORE = asyncio.Semaphore(8)
+        ASN_SEMAPHORE_LOOP = loop
+    return ASN_LOOKUP_SEMAPHORE
+
+
 def init_db() -> None:
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    with connect() as db:
+    with connect_db() as db:
         db.executescript(
             """
             create table if not exists settings (
@@ -141,13 +200,13 @@ def init_db() -> None:
               api_token text not null,
               public_node_refs text not null,
               node_overrides text not null default '{}',
-              public_protocols text not null default '{}'
+              public_protocols text not null default '{}',
+              pinned_api_host text not null default ''
             );
             create table if not exists sessions (
               session_id text primary key,
               created_at integer not null
             );
-            drop table if exists query_owners;
             create table if not exists query_access (
               query_id text not null,
               owner_hash text not null,
@@ -159,6 +218,7 @@ def init_db() -> None:
               slot_id text primary key,
               node_ref text not null,
               query_id text,
+              owner_hash text,
               created_at integer not null,
               deadline_at integer not null,
               active integer not null
@@ -177,10 +237,23 @@ def init_db() -> None:
             db.execute("alter table settings add column node_overrides text not null default '{}'")
         if "public_protocols" not in columns:
             db.execute("alter table settings add column public_protocols text not null default '{}'")
+        if "pinned_api_host" not in columns:
+            db.execute("alter table settings add column pinned_api_host text not null default ''")
+        slot_columns = {row["name"] for row in db.execute("pragma table_info(query_slots)").fetchall()}
+        if "owner_hash" not in slot_columns:
+            db.execute("alter table query_slots add column owner_hash text")
+        legacy_query_owners = db.execute("select name from sqlite_master where type = 'table' and name = 'query_owners'").fetchone()
+        if legacy_query_owners:
+            db.execute(
+                """
+                insert or ignore into query_access (query_id, owner_hash, node_ref, created_at)
+                select query_id, '', node_ref, created_at from query_owners
+                """
+            )
         row = db.execute("select id from settings where id = 1").fetchone()
         if row is None:
             db.execute(
-                "insert into settings (id, title, api_base, api_token, public_node_refs, node_overrides, public_protocols) values (1, ?, ?, ?, ?, ?, ?)",
+                "insert into settings (id, title, api_base, api_token, public_node_refs, node_overrides, public_protocols, pinned_api_host) values (1, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     "Link42 Looking Glass",
                     os.getenv("LG_API_BASE") or "",
@@ -188,8 +261,16 @@ def init_db() -> None:
                     "[]",
                     "{}",
                     "{}",
+                    "",
                 ),
             )
+        row = db.execute("select api_base, pinned_api_host from settings where id = 1").fetchone()
+        if row and not row["pinned_api_host"] and row["api_base"]:
+            try:
+                parsed = urlsplit(normalize_api_base(row["api_base"]))
+                db.execute("update settings set pinned_api_host = ? where id = 1", (parsed.hostname or "",))
+            except ValueError:
+                pass
         db.execute("delete from sessions where created_at < ?", (int(time.time()) - SESSION_TTL_SECONDS,))
         db.execute("delete from query_access where created_at < ?", (int(time.time()) - 60 * 60,))
         db.execute("delete from query_slots where active = 0 or deadline_at < ?", (int(time.time()),))
@@ -197,7 +278,7 @@ def init_db() -> None:
 
 
 def get_settings() -> dict[str, Any]:
-    with connect() as db:
+    with connect_db() as db:
         row = db.execute("select * from settings where id = 1").fetchone()
     refs = []
     overrides = {}
@@ -221,15 +302,16 @@ def get_settings() -> dict[str, Any]:
         "publicNodeRefs": refs if isinstance(refs, list) else [],
         "nodeOverrides": overrides if isinstance(overrides, dict) else {},
         "publicProtocols": protocols if isinstance(protocols, dict) else {},
+        "pinnedApiHost": row["pinned_api_host"] if "pinned_api_host" in row.keys() else "",
     }
 
 
 def save_settings(settings: dict[str, Any]) -> None:
-    with connect() as db:
+    with connect_db() as db:
         db.execute(
             """
             update settings
-            set title = ?, api_base = ?, api_token = ?, public_node_refs = ?, node_overrides = ?, public_protocols = ?
+            set title = ?, api_base = ?, api_token = ?, public_node_refs = ?, node_overrides = ?, public_protocols = ?, pinned_api_host = ?
             where id = 1
             """,
             (
@@ -239,6 +321,7 @@ def save_settings(settings: dict[str, Any]) -> None:
                 json.dumps(settings["publicNodeRefs"], ensure_ascii=False),
                 json.dumps(settings["nodeOverrides"], ensure_ascii=False),
                 json.dumps(settings["publicProtocols"], ensure_ascii=False),
+                settings.get("pinnedApiHost", ""),
             ),
         )
 
@@ -350,7 +433,7 @@ def admin_settings(settings: dict[str, Any]) -> dict[str, Any]:
         "apiBase": settings["apiBase"],
         "configured": bool(settings["apiBase"] and token),
         "apiTokenSet": bool(token),
-        "apiTokenPreview": f"{token[:10]}...{token[-4:]}" if len(token) > 14 else ("set" if token else ""),
+        "apiTokenPreview": f"...{token[-4:]}" if len(token) >= 4 else ("set" if token else ""),
         "publicNodeRefs": settings["publicNodeRefs"],
         "nodeOverrides": settings["nodeOverrides"],
         "publicProtocols": settings["publicProtocols"],
@@ -361,7 +444,7 @@ def is_admin(session_id: str | None) -> bool:
     if not session_id:
         return False
     cutoff = int(time.time()) - SESSION_TTL_SECONDS
-    with connect() as db:
+    with connect_db() as db:
         row = db.execute(
             "select created_at from sessions where session_id = ? and created_at >= ?",
             (session_id, cutoff),
@@ -420,7 +503,7 @@ def validate_resource_id(value: str, kind: str) -> str:
 def login_retry_after(request: Request) -> int:
     now = int(time.time())
     key = client_hash(request)
-    with connect() as db:
+    with connect_db() as db:
         row = db.execute(
             "select blocked_until from login_failures where client_hash = ?",
             (key,),
@@ -431,7 +514,7 @@ def login_retry_after(request: Request) -> int:
 def record_login_failure(request: Request) -> int:
     now = int(time.time())
     key = client_hash(request)
-    with connect() as db:
+    with connect_db() as db:
         db.execute("begin immediate")
         row = db.execute(
             "select failures, window_started from login_failures where client_hash = ?",
@@ -461,7 +544,7 @@ def record_login_failure(request: Request) -> int:
 
 
 def clear_login_failures(request: Request) -> None:
-    with connect() as db:
+    with connect_db() as db:
         db.execute("delete from login_failures where client_hash = ?", (client_hash(request),))
 
 
@@ -523,6 +606,20 @@ def filter_protocol_stdout(stdout: str, blocked_protocols: set[str]) -> str:
     return "\n".join(filtered) + ("\n" if stdout.endswith("\n") and filtered else "")
 
 
+def filter_route_stdout(stdout: str, blocked_protocols: set[str]) -> str:
+    if not stdout or not blocked_protocols:
+        return stdout
+    output = []
+    route_header = re.compile(r"^(\s*.*?\[)([^\s\]]+)(\s+[^\]]*\].*)$")
+    for line in stdout.splitlines():
+        match = route_header.match(line)
+        if match and match.group(2) in blocked_protocols:
+            output.append(f"{match.group(1)}hidden{match.group(3)}")
+        else:
+            output.append(line)
+    return "\n".join(output) + ("\n" if stdout.endswith("\n") else "")
+
+
 def sanitize_query_payload(payload: dict[str, Any], settings: dict[str, Any], admin: bool) -> dict[str, Any]:
     if admin:
         return payload
@@ -537,6 +634,10 @@ def sanitize_query_payload(payload: dict[str, Any], settings: dict[str, Any], ad
         result = payload.get("result")
         if isinstance(result, dict) and isinstance(result.get("stdout"), str):
             payload = {**payload, "result": {**result, "stdout": filter_protocol_stdout(result["stdout"], blocked)}}
+    if operation in {"bird.route_lookup", "bird.routes_by_origin_as"}:
+        result = payload.get("result")
+        if isinstance(result, dict) and isinstance(result.get("stdout"), str):
+            payload = {**payload, "result": {**result, "stdout": filter_route_stdout(result["stdout"], blocked)}}
     return payload
 
 
@@ -544,7 +645,8 @@ def present_node(node: dict[str, Any], settings: dict[str, Any], admin: bool) ->
     node_ref = str(node.get("node_ref", ""))
     override = settings["nodeOverrides"].get(node_ref, {})
     presented = dict(node)
-    presented["raw_name"] = node.get("raw_name") or node.get("name") or node_ref
+    if admin:
+        presented["raw_name"] = node.get("raw_name") or node.get("name") or node_ref
     if isinstance(override, dict):
         name = str(override.get("name", "")).strip()
         icon = str(override.get("icon", "")).strip()
@@ -554,7 +656,8 @@ def present_node(node: dict[str, Any], settings: dict[str, Any], admin: bool) ->
             presented["icon"] = icon
     if admin:
         return presented
-    return {key: value for key, value in presented.items() if key != "ips"}
+    allowed = {"node_ref", "name", "icon", "region", "online", "capabilities", "last_seen_at"}
+    return {key: value for key, value in presented.items() if key in allowed}
 
 
 async def link42_request(path: str, *, method: str = "GET", json_body: Any = None) -> tuple[dict[str, Any], httpx.Response]:
@@ -562,28 +665,42 @@ async def link42_request(path: str, *, method: str = "GET", json_body: Any = Non
     if not settings["apiBase"] or not settings["apiToken"]:
         raise HTTPException(status_code=409, detail={"code": "api_not_configured", "message": "Looking Glass API is not configured"})
     base = await validate_api_base(settings["apiBase"])
-    async with httpx.AsyncClient(timeout=25.0) as client:
-        response = await client.request(
-            method,
-            f"{base}{path}",
-            headers={
-                "Accept": "application/json",
-                "Authorization": f"Bearer {settings['apiToken']}",
-                **({"Content-Type": "application/json"} if json_body is not None else {}),
-            },
-            json=json_body,
-        )
+    try:
+        response = await get_upstream_client().request(
+                method,
+                f"{base}{path}",
+                headers={
+                    "Accept": "application/json",
+                    "Authorization": f"Bearer {settings['apiToken']}",
+                    **({"Content-Type": "application/json"} if json_body is not None else {}),
+                },
+                json=json_body,
+            )
+    except httpx.TimeoutException as exc:
+        LOGGER.warning("Link42 upstream timeout for %s", path)
+        raise HTTPException(status_code=504, detail={"code": "upstream_timeout", "message": "Link42 request timed out"}) from exc
+    except httpx.RequestError as exc:
+        LOGGER.warning("Link42 upstream unavailable for %s: %s", path, type(exc).__name__)
+        raise HTTPException(status_code=502, detail={"code": "upstream_unavailable", "message": "Link42 is unavailable"}) from exc
     try:
         payload = response.json()
-    except ValueError:
-        payload = {}
+    except ValueError as exc:
+        raise HTTPException(status_code=502, detail={"code": "invalid_upstream_response", "message": "Link42 returned invalid JSON"}) from exc
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=502, detail={"code": "invalid_upstream_response", "message": "Link42 returned an invalid object"})
     if response.status_code >= 400:
-        raise HTTPException(status_code=response.status_code, detail=payload.get("error") or payload or {"message": response.text})
+        if response.status_code in {401, 403}:
+            raise HTTPException(status_code=502, detail={"code": "upstream_auth_failed", "message": "Link42 rejected the configured credentials"})
+        if response.status_code == 429:
+            raise HTTPException(status_code=502, detail={"code": "upstream_rate_limited", "message": "Link42 is rate limiting requests"})
+        error = payload.get("error") if isinstance(payload, dict) else None
+        message = error.get("message") if isinstance(error, dict) else None
+        raise HTTPException(status_code=502, detail={"code": "upstream_error", "message": message or "Link42 returned an error"})
     return payload, response
 
 
 def store_query_owner(query_id: str, node_ref: str, owner_hash: str) -> None:
-    with connect() as db:
+    with connect_db() as db:
         db.execute("delete from query_access where created_at < ?", (int(time.time()) - 60 * 60,))
         db.execute(
             "insert or replace into query_access (query_id, owner_hash, node_ref, created_at) values (?, ?, ?, ?)",
@@ -592,7 +709,7 @@ def store_query_owner(query_id: str, node_ref: str, owner_hash: str) -> None:
 
 
 def get_query_owner(query_id: str, owner_hash: str | None, admin: bool) -> str | None:
-    with connect() as db:
+    with connect_db() as db:
         if admin:
             row = db.execute(
                 "select node_ref from query_access where query_id = ? order by created_at desc limit 1",
@@ -612,26 +729,35 @@ def cleanup_query_slots(db: sqlite3.Connection) -> None:
     db.execute("delete from query_slots where active = 0 or deadline_at < ?", (int(time.time()),))
 
 
-def acquire_node_slot(node_ref: str) -> str:
+def acquire_node_slot(node_ref: str, owner_hash: str | None) -> str:
     db = connect()
     try:
         db.execute("begin immediate")
         cleanup_query_slots(db)
-        row = db.execute(
-            "select count(*) as total from query_slots where node_ref = ? and active = 1",
-            (node_ref,),
-        ).fetchone()
+        row = db.execute("select count(*) as total from query_slots where node_ref = ? and active = 1", (node_ref,)).fetchone()
         if int(row["total"] or 0) >= NODE_CONCURRENCY_LIMIT:
             db.rollback()
             raise HTTPException(
                 status_code=429,
                 detail={"code": "query_queue_full", "message": "Node query concurrency limit reached"},
             )
+        if owner_hash:
+            row = db.execute(
+                """
+                select count(*) as total
+                from query_slots
+                where node_ref = ? and active = 1 and owner_hash = ?
+                """,
+                (node_ref, owner_hash),
+            ).fetchone()
+            if int(row["total"] or 0) >= PER_CLIENT_NODE_CONCURRENCY_LIMIT:
+                db.rollback()
+                raise HTTPException(status_code=429, headers={"Retry-After": "2"}, detail={"code": "client_query_queue_full", "message": "You already have a query running on this node"})
         slot_id = secrets.token_urlsafe(18)
         now = int(time.time())
         db.execute(
-            "insert into query_slots (slot_id, node_ref, query_id, created_at, deadline_at, active) values (?, ?, null, ?, ?, 1)",
-            (slot_id, node_ref, now, now + LOCAL_QUERY_DEADLINE_SECONDS),
+            "insert into query_slots (slot_id, node_ref, query_id, owner_hash, created_at, deadline_at, active) values (?, ?, null, ?, ?, ?, 1)",
+            (slot_id, node_ref, owner_hash, now, now + LOCAL_QUERY_DEADLINE_SECONDS),
         )
         db.commit()
         return slot_id
@@ -644,8 +770,10 @@ def acquire_node_slot(node_ref: str) -> str:
 
 
 def bind_node_slot(slot_id: str, query_id: str, deadline_at: int | None) -> None:
-    deadline = deadline_at if deadline_at and deadline_at > int(time.time()) else int(time.time()) + LOCAL_QUERY_DEADLINE_SECONDS
-    with connect() as db:
+    now = int(time.time())
+    upstream_deadline = int(deadline_at) if isinstance(deadline_at, (int, float)) else now + LOCAL_QUERY_DEADLINE_SECONDS
+    deadline = min(max(upstream_deadline, now + 1), now + LOCAL_QUERY_DEADLINE_SECONDS)
+    with connect_db() as db:
         db.execute(
             "update query_slots set query_id = ?, deadline_at = ? where slot_id = ?",
             (query_id, deadline, slot_id),
@@ -653,12 +781,12 @@ def bind_node_slot(slot_id: str, query_id: str, deadline_at: int | None) -> None
 
 
 def release_node_slot(slot_id: str) -> None:
-    with connect() as db:
+    with connect_db() as db:
         db.execute("delete from query_slots where slot_id = ?", (slot_id,))
 
 
 def release_query_slot(query_id: str) -> None:
-    with connect() as db:
+    with connect_db() as db:
         db.execute("delete from query_slots where query_id = ?", (query_id,))
 
 
@@ -743,9 +871,34 @@ class FixedWindowRateLimiter:
 RATE_LIMITER = FixedWindowRateLimiter()
 
 
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    global UPSTREAM_CLIENT, ASN_CLIENT, UPSTREAM_CLIENT_LOOP, ASN_CLIENT_LOOP
+    global ASN_LOOKUP_SEMAPHORE, ASN_SEMAPHORE_LOOP
+    loop = asyncio.get_running_loop()
+    UPSTREAM_CLIENT = httpx.AsyncClient(timeout=httpx.Timeout(25.0, connect=5.0), follow_redirects=False)
+    UPSTREAM_CLIENT_LOOP = loop
+    ASN_CLIENT = httpx.AsyncClient(timeout=httpx.Timeout(10.0, connect=3.0), follow_redirects=False)
+    ASN_CLIENT_LOOP = loop
+    ASN_LOOKUP_SEMAPHORE = asyncio.Semaphore(8)
+    ASN_SEMAPHORE_LOOP = loop
+    try:
+        yield
+    finally:
+        clients = [client for client in (UPSTREAM_CLIENT, ASN_CLIENT) if client is not None and not client.is_closed]
+        if clients:
+            await asyncio.gather(*(client.aclose() for client in clients))
+        UPSTREAM_CLIENT = None
+        ASN_CLIENT = None
+        UPSTREAM_CLIENT_LOOP = None
+        ASN_CLIENT_LOOP = None
+        ASN_LOOKUP_SEMAPHORE = None
+        ASN_SEMAPHORE_LOOP = None
+
+
 init_db()
 warn_if_insecure_api_base(get_settings()["apiBase"])
-app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
+app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None, lifespan=lifespan)
 app.add_middleware(RequestBodyLimitMiddleware, max_bytes=MAX_REQUEST_BODY_BYTES)
 
 
@@ -796,10 +949,18 @@ async def security_and_rate_limit(request: Request, call_next: Any):
 
 
 @app.get("/api/session")
-async def session(lg_admin_session: str | None = Cookie(default=None)):
+async def session(request: Request, response: Response, lg_admin_session: str | None = Cookie(default=None), lg_query_client: str | None = Cookie(default=None)):
     settings = get_settings()
     admin = is_admin(lg_admin_session)
+    query_client, cookie_created = get_or_create_query_client(lg_query_client)
+    if cookie_created:
+        set_private_cookie(response, request, QUERY_CLIENT_COOKIE, query_client, 60 * 60 * 2)
     return {"isAdmin": admin, "settings": admin_settings(settings) if admin else public_settings(settings)}
+
+
+@app.get("/healthz", include_in_schema=False)
+async def healthz():
+    return {"status": "ok"}
 
 
 @app.post("/api/auth/login")
@@ -822,7 +983,7 @@ async def login(body: LoginBody, request: Request, response: Response):
         raise HTTPException(status_code=401, detail={"code": "invalid_password", "message": "Invalid password"})
     clear_login_failures(request)
     session_id = secrets.token_urlsafe(32)
-    with connect() as db:
+    with connect_db() as db:
         db.execute("insert into sessions (session_id, created_at) values (?, ?)", (session_id, int(time.time())))
     set_private_cookie(response, request, SESSION_COOKIE, session_id, SESSION_TTL_SECONDS)
     return {"ok": True}
@@ -831,7 +992,7 @@ async def login(body: LoginBody, request: Request, response: Response):
 @app.post("/api/auth/logout")
 async def logout(request: Request, response: Response, lg_admin_session: str | None = Cookie(default=None)):
     if lg_admin_session:
-        with connect() as db:
+        with connect_db() as db:
             db.execute("delete from sessions where session_id = ?", (lg_admin_session,))
     response.delete_cookie(SESSION_COOKIE, path="/", secure=use_secure_cookie(request), httponly=True, samesite="lax")
     return {"ok": True}
@@ -852,17 +1013,11 @@ async def update_admin_settings(body: SettingsBody, lg_admin_session: str | None
     except ValueError:
         current_api_base = ""
     api_base = await validate_api_base(body.apiBase, allow_empty=True)
-    if api_base and current_api_base and not API_ALLOWED_HOSTS:
-        current_host = (urlsplit(current_api_base).hostname or "").lower()
-        next_host = (urlsplit(api_base).hostname or "").lower()
-        if next_host != current_host:
-            raise HTTPException(
-                status_code=400,
-                detail={
-                    "code": "api_host_not_allowed",
-                    "message": "Changing the API host requires LG_API_ALLOWED_HOSTS to include the new host",
-                },
-            )
+    current_host = (urlsplit(current_api_base).hostname or "").lower() if current_api_base else ""
+    next_host = (urlsplit(api_base).hostname or "").lower() if api_base else ""
+    pinned_host = current.get("pinnedApiHost") or current_host
+    if api_base and pinned_host and next_host != pinned_host and not API_ALLOWED_HOSTS:
+        raise HTTPException(status_code=400, detail={"code": "api_host_not_allowed", "message": "Changing the API host requires LG_API_ALLOWED_HOSTS to include the new host"})
     source_changed = api_base != current_api_base
     token = ""
     if body.clearApiToken:
@@ -880,6 +1035,7 @@ async def update_admin_settings(body: SettingsBody, lg_admin_session: str | None
         "publicNodeRefs": [str(ref) for ref in body.publicNodeRefs if RESOURCE_ID_RE.fullmatch(str(ref))],
         "nodeOverrides": clean_node_overrides(body.nodeOverrides),
         "publicProtocols": clean_public_protocols(body.publicProtocols),
+        "pinnedApiHost": pinned_host or next_host,
     }
     warn_if_insecure_api_base(api_base)
     save_settings(next_settings)
@@ -887,8 +1043,12 @@ async def update_admin_settings(body: SettingsBody, lg_admin_session: str | None
 
 
 @app.get("/api/nodes")
-async def nodes(limit: int = 100, lg_admin_session: str | None = Cookie(default=None)):
-    payload, _ = await link42_request(f"/nodes?limit={max(1, min(limit, 500))}")
+async def nodes(limit: int = 100, cursor: str | None = None, lg_admin_session: str | None = Cookie(default=None)):
+    limit = max(1, min(limit, 500))
+    if cursor and (len(cursor) > 512 or not re.fullmatch(r"[A-Za-z0-9._~:/+=-]+", cursor)):
+        raise HTTPException(status_code=400, detail={"code": "invalid_cursor", "message": "Invalid node cursor"})
+    query = urlencode({"limit": limit, **({"cursor": cursor} if cursor else {})})
+    payload, _ = await link42_request(f"/nodes?{query}")
     settings = get_settings()
     admin = is_admin(lg_admin_session)
     items = payload.get("items") if isinstance(payload.get("items"), list) else []
@@ -910,7 +1070,8 @@ async def submit_node_query(
     settings = get_settings()
     if not is_admin(lg_admin_session) and node_ref not in settings["publicNodeRefs"]:
         raise HTTPException(status_code=404, detail={"code": "node_not_found", "message": "Node not found"})
-    slot_id = acquire_node_slot(node_ref)
+    owner_hash = query_owner_hash(query_client_id) if query_client_id and COOKIE_TOKEN_RE.fullmatch(query_client_id) else None
+    slot_id = acquire_node_slot(node_ref, owner_hash)
     try:
         payload, upstream = await link42_request(f"/nodes/{node_ref}{upstream_path}", method="POST", json_body=json_body)
     except Exception:
@@ -1039,20 +1200,43 @@ async def query(query_id: str, response: Response, lg_admin_session: str | None 
 
 @app.get("/api/as/{asn}")
 async def as_name(asn: str):
-    clean = asn.upper().removeprefix("AS")
-    if not clean.isdigit() or len(clean) > 10:
+    match = re.fullmatch(r"(?:AS)?([0-9]{1,10})", asn or "", re.IGNORECASE)
+    if not match:
         raise HTTPException(status_code=400, detail={"code": "invalid_asn", "message": "Invalid ASN"})
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        if clean.startswith("424242"):
-            response = await client.get(f"https://explorer.burble.com/api/registry/aut-num/AS{clean}")
-            payload = response.json()
-            obj = payload.get(f"aut-num/AS{clean}", {})
-            attrs = obj.get("Attributes") if isinstance(obj.get("Attributes"), list) else []
-            name = next((value for key, value in attrs if key == "as-name"), "") or next((value for key, value in attrs if key == "descr"), "")
-            return {"asn": clean, "name": name}
-        response = await client.get(f"https://stat.ripe.net/data/as-overview/data.json?resource=AS{clean}")
-        payload = response.json()
-        return {"asn": clean, "name": payload.get("data", {}).get("holder", "")}
+    clean = str(int(match.group(1)))
+    if not 1 <= int(clean) <= 4294967295:
+        raise HTTPException(status_code=400, detail={"code": "invalid_asn", "message": "Invalid ASN"})
+    now = time.time()
+    with ASN_CACHE_LOCK:
+        cached = ASN_CACHE.get(clean)
+        if cached and cached[0] > now:
+            return {"asn": clean, "name": cached[1]}
+    async with get_asn_semaphore():
+        try:
+            if clean.startswith("424242"):
+                response = await get_asn_client().get(f"https://explorer.burble.com/api/registry/aut-num/AS{clean}")
+                response.raise_for_status()
+                payload = response.json()
+                obj = payload.get(f"aut-num/AS{clean}", {}) if isinstance(payload, dict) else {}
+                attrs = obj.get("Attributes") if isinstance(obj, dict) and isinstance(obj.get("Attributes"), list) else []
+                name = next((value for key, value in attrs if key == "as-name"), "") or next((value for key, value in attrs if key == "descr"), "")
+            else:
+                response = await get_asn_client().get(f"https://stat.ripe.net/data/as-overview/data.json?resource=AS{clean}")
+                response.raise_for_status()
+                payload = response.json()
+                name = payload.get("data", {}).get("holder", "") if isinstance(payload, dict) else ""
+        except httpx.TimeoutException as exc:
+            raise HTTPException(status_code=504, detail={"code": "asn_lookup_timeout", "message": "ASN lookup timed out"}) from exc
+        except (httpx.RequestError, httpx.HTTPStatusError, ValueError) as exc:
+            raise HTTPException(status_code=502, detail={"code": "asn_lookup_unavailable", "message": "ASN lookup is unavailable"}) from exc
+    with ASN_CACHE_LOCK:
+        ASN_CACHE[clean] = (now + (3600 if name else 60), name)
+    return {"asn": clean, "name": name}
+
+
+@app.api_route("/api/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"], include_in_schema=False)
+async def unknown_api(path: str):
+    raise HTTPException(status_code=404, detail={"code": "not_found", "message": "API endpoint not found"})
 
 
 if DIST_DIR.exists():
@@ -1078,5 +1262,5 @@ async def disabled_api_documentation():
 async def frontend(path: str):
     index = DIST_DIR / "index.html"
     if index.exists():
-        return FileResponse(index)
+        return FileResponse(index, headers={"Cache-Control": "no-cache"})
     raise HTTPException(status_code=404, detail="Frontend is not built. Run npm run build.")
