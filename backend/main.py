@@ -10,7 +10,7 @@ import socket
 import sqlite3
 import threading
 import time
-from contextlib import asynccontextmanager, contextmanager
+from contextlib import asynccontextmanager, contextmanager, suppress
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlencode, urlsplit, urlunsplit
@@ -49,6 +49,7 @@ DOMAIN_RE = re.compile(
 PROTOCOL_NAME_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.:-]{0,63}$")
 RESOURCE_ID_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.:-]{0,127}$")
 COOKIE_TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{20,128}$")
+BIRD_ROUTE_HEADER_RE = re.compile(r"^\s*(?:(?P<prefix>\S+)\s+)?unicast\s+\[(?P<source>[^\]]+)\]", re.MULTILINE)
 LOGGER = logging.getLogger("uvicorn.error")
 UPSTREAM_CLIENT: httpx.AsyncClient | None = None
 ASN_CLIENT: httpx.AsyncClient | None = None
@@ -161,6 +162,15 @@ def connect_db() -> Any:
         db.close()
 
 
+def cleanup_expired_records() -> None:
+    now = int(time.time())
+    with connect_db() as db:
+        db.execute("delete from sessions where created_at < ?", (now - SESSION_TTL_SECONDS,))
+        db.execute("delete from query_access where created_at < ?", (now - 60 * 60,))
+        db.execute("delete from query_slots where active = 0 or deadline_at < ?", (now,))
+        db.execute("delete from login_failures where updated_at < ?", (now - 60 * 60 * 24,))
+
+
 def get_upstream_client() -> httpx.AsyncClient:
     global UPSTREAM_CLIENT, UPSTREAM_CLIENT_LOOP
     loop = asyncio.get_running_loop()
@@ -271,10 +281,11 @@ def init_db() -> None:
                 db.execute("update settings set pinned_api_host = ? where id = 1", (parsed.hostname or "",))
             except ValueError:
                 pass
-        db.execute("delete from sessions where created_at < ?", (int(time.time()) - SESSION_TTL_SECONDS,))
-        db.execute("delete from query_access where created_at < ?", (int(time.time()) - 60 * 60,))
-        db.execute("delete from query_slots where active = 0 or deadline_at < ?", (int(time.time()),))
-        db.execute("delete from login_failures where updated_at < ?", (int(time.time()) - 60 * 60 * 24,))
+        now = int(time.time())
+        db.execute("delete from sessions where created_at < ?", (now - SESSION_TTL_SECONDS,))
+        db.execute("delete from query_access where created_at < ?", (now - 60 * 60,))
+        db.execute("delete from query_slots where active = 0 or deadline_at < ?", (now,))
+        db.execute("delete from login_failures where updated_at < ?", (now - 60 * 60 * 24,))
 
 
 def get_settings() -> dict[str, Any]:
@@ -609,15 +620,45 @@ def filter_protocol_stdout(stdout: str, blocked_protocols: set[str]) -> str:
 def filter_route_stdout(stdout: str, blocked_protocols: set[str]) -> str:
     if not stdout or not blocked_protocols:
         return stdout
-    output = []
-    route_header = re.compile(r"^(\s*.*?\[)([^\s\]]+)(\s+[^\]]*\].*)$")
+    output: list[str] = []
+    route_block: list[str] = []
+    route_block_hidden = False
+
+    def flush_route() -> None:
+        if route_block and not route_block_hidden:
+            output.extend(route_block)
+
     for line in stdout.splitlines():
-        match = route_header.match(line)
-        if match and match.group(2) in blocked_protocols:
-            output.append(f"{match.group(1)}hidden{match.group(3)}")
+        match = BIRD_ROUTE_HEADER_RE.match(line)
+        if match:
+            flush_route()
+            route_block = [line]
+            protocol_name = match.group("source").split(None, 1)[0]
+            route_block_hidden = protocol_name in blocked_protocols
+        elif route_block:
+            route_block.append(line)
         else:
             output.append(line)
+    flush_route()
     return "\n".join(output) + ("\n" if stdout.endswith("\n") else "")
+
+
+def filter_route_result(result: dict[str, Any], blocked_protocols: set[str]) -> dict[str, Any]:
+    filtered = dict(result)
+    if isinstance(filtered.get("stdout"), str):
+        filtered["stdout"] = filter_route_stdout(filtered["stdout"], blocked_protocols)
+    for key in ("routes", "items", "entries"):
+        values = filtered.get(key)
+        if not isinstance(values, list):
+            continue
+        filtered[key] = [
+            entry
+            for entry in values
+            if not isinstance(entry, dict)
+            or str(entry.get("protocol") or entry.get("protocol_name") or entry.get("source") or "").split(None, 1)[0]
+            not in blocked_protocols
+        ]
+    return filtered
 
 
 def sanitize_query_payload(payload: dict[str, Any], settings: dict[str, Any], admin: bool) -> dict[str, Any]:
@@ -634,10 +675,12 @@ def sanitize_query_payload(payload: dict[str, Any], settings: dict[str, Any], ad
         result = payload.get("result")
         if isinstance(result, dict) and isinstance(result.get("stdout"), str):
             payload = {**payload, "result": {**result, "stdout": filter_protocol_stdout(result["stdout"], blocked)}}
-    if operation in {"bird.route_lookup", "bird.routes_by_origin_as"}:
-        result = payload.get("result")
-        if isinstance(result, dict) and isinstance(result.get("stdout"), str):
-            payload = {**payload, "result": {**result, "stdout": filter_route_stdout(result["stdout"], blocked)}}
+    result = payload.get("result")
+    if isinstance(result, dict) and isinstance(result.get("stdout"), str):
+        stdout = result["stdout"]
+        looks_like_routes = BIRD_ROUTE_HEADER_RE.search(stdout) is not None
+        if operation in {"bird.route_lookup", "bird.routes_by_origin_as"} or looks_like_routes:
+            payload = {**payload, "result": filter_route_result(result, blocked)}
     return payload
 
 
@@ -871,6 +914,15 @@ class FixedWindowRateLimiter:
 RATE_LIMITER = FixedWindowRateLimiter()
 
 
+async def periodic_cleanup() -> None:
+    while True:
+        await asyncio.sleep(15 * 60)
+        try:
+            await asyncio.to_thread(cleanup_expired_records)
+        except Exception:
+            LOGGER.exception("Periodic SQLite cleanup failed")
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     global UPSTREAM_CLIENT, ASN_CLIENT, UPSTREAM_CLIENT_LOOP, ASN_CLIENT_LOOP
@@ -882,9 +934,13 @@ async def lifespan(_: FastAPI):
     ASN_CLIENT_LOOP = loop
     ASN_LOOKUP_SEMAPHORE = asyncio.Semaphore(8)
     ASN_SEMAPHORE_LOOP = loop
+    cleanup_task = asyncio.create_task(periodic_cleanup())
     try:
         yield
     finally:
+        cleanup_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await cleanup_task
         clients = [client for client in (UPSTREAM_CLIENT, ASN_CLIENT) if client is not None and not client.is_closed]
         if clients:
             await asyncio.gather(*(client.aclose() for client in clients))
@@ -1052,6 +1108,7 @@ async def nodes(limit: int = 100, cursor: str | None = None, lg_admin_session: s
     settings = get_settings()
     admin = is_admin(lg_admin_session)
     items = payload.get("items") if isinstance(payload.get("items"), list) else []
+    items = [node for node in items if isinstance(node, dict)]
     if not admin:
         items = [node for node in items if node.get("node_ref") in settings["publicNodeRefs"]]
     return {"items": [present_node(node, settings, admin) for node in items], "next_cursor": payload.get("next_cursor")}
@@ -1217,14 +1274,27 @@ async def as_name(asn: str):
                 response = await get_asn_client().get(f"https://explorer.burble.com/api/registry/aut-num/AS{clean}")
                 response.raise_for_status()
                 payload = response.json()
-                obj = payload.get(f"aut-num/AS{clean}", {}) if isinstance(payload, dict) else {}
+                if not isinstance(payload, dict):
+                    raise ValueError("ASN registry returned an invalid object")
+                obj = payload.get(f"aut-num/AS{clean}", {})
                 attrs = obj.get("Attributes") if isinstance(obj, dict) and isinstance(obj.get("Attributes"), list) else []
-                name = next((value for key, value in attrs if key == "as-name"), "") or next((value for key, value in attrs if key == "descr"), "")
+                name = ""
+                for attribute in attrs:
+                    if not isinstance(attribute, (list, tuple)) or len(attribute) < 2:
+                        continue
+                    key, value = attribute[0], attribute[1]
+                    if key in {"as-name", "descr"} and isinstance(value, str) and value.strip():
+                        name = value.strip()
+                        if key == "as-name":
+                            break
             else:
                 response = await get_asn_client().get(f"https://stat.ripe.net/data/as-overview/data.json?resource=AS{clean}")
                 response.raise_for_status()
                 payload = response.json()
-                name = payload.get("data", {}).get("holder", "") if isinstance(payload, dict) else ""
+                if not isinstance(payload, dict):
+                    raise ValueError("ASN overview returned an invalid object")
+                data = payload.get("data")
+                name = data.get("holder", "") if isinstance(data, dict) and isinstance(data.get("holder"), str) else ""
         except httpx.TimeoutException as exc:
             raise HTTPException(status_code=504, detail={"code": "asn_lookup_timeout", "message": "ASN lookup timed out"}) from exc
         except (httpx.RequestError, httpx.HTTPStatusError, ValueError) as exc:

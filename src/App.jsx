@@ -514,6 +514,39 @@ async function apiFetch(path, options = {}) {
   return { json, response };
 }
 
+function waitForDelay(delayMs, signal) {
+  return new Promise((resolve) => {
+    let timer;
+    const finish = (completed) => {
+      window.clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
+      resolve(completed);
+    };
+    const onAbort = () => finish(false);
+    if (signal?.aborted) {
+      resolve(false);
+      return;
+    }
+    timer = window.setTimeout(() => finish(true), delayMs);
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
+function isAbortError(error) {
+  return error?.name === "AbortError";
+}
+
+function replaceAbortController(ref) {
+  ref.current?.abort();
+  const controller = new AbortController();
+  ref.current = controller;
+  return controller;
+}
+
+function finishAbortController(ref, controller) {
+  if (ref.current === controller) ref.current = null;
+}
+
 function parseBirdRoutes(stdout = "") {
   const lines = stdout.split(/\r?\n/);
   const table = lines.find((line) => line.startsWith("Table "))?.match(/^Table\s+([^:]+):/)?.[1] || "";
@@ -574,8 +607,8 @@ function parseBirdProtocols(stdout = "") {
     .map((line) => {
       const parts = line.split(/\s+/);
       const [name, proto, table, state] = parts;
-      const since = parts.length >= 6 ? `${parts[4]} ${parts[5]}` : parts[4] || "";
-      const info = parts.slice(parts.length >= 6 ? 6 : 5).join(" ");
+      const since = parts[4] || "";
+      const info = parts.slice(5).join(" ");
       return { name, proto, table, state, since, info, raw: line };
     })
     .filter((item) => item.name && item.proto);
@@ -663,33 +696,53 @@ function parseBirdProtocolDetail(stdout = "", fallbackProtocol = {}) {
 }
 
 const asNameCache = new Map();
+const ASN_NAME_SUCCESS_TTL = 60 * 60 * 1000;
+const ASN_NAME_FAILURE_TTL = 15 * 1000;
 
 function extractAsns(asPath = "") {
   return Array.from(new Set((asPath.match(/\b\d{1,10}\b/g) || []).map((asn) => asn.trim())));
 }
 
-async function fetchAsName(asn) {
-  if (asNameCache.has(asn)) return asNameCache.get(asn);
+async function fetchAsName(asn, signal) {
+  const cached = asNameCache.get(asn);
+  if (cached && cached.expiresAt > Date.now()) return cached.value;
+  asNameCache.delete(asn);
   const controller = new AbortController();
   const timeout = window.setTimeout(() => controller.abort(), 5000);
+  const abort = () => controller.abort();
+  signal?.addEventListener("abort", abort, { once: true });
   try {
-    if (/^424242\d+$/.test(asn)) {
-      // DN42 and public ASN lookup are both proxied by the backend.
-    }
     const response = await fetch(`/api/as/${asn}`, {
       signal: controller.signal,
       credentials: "include",
     });
+    if (!response.ok) throw new Error(`ASN lookup failed: ${response.status}`);
     const json = await response.json();
     const value = json?.name?.trim() || "";
-    asNameCache.set(asn, value);
+    asNameCache.set(asn, { value, expiresAt: Date.now() + (value ? ASN_NAME_SUCCESS_TTL : ASN_NAME_FAILURE_TTL) });
     return value;
-  } catch {
-    asNameCache.set(asn, "");
+  } catch (error) {
+    if (isAbortError(error) && signal?.aborted) throw error;
+    asNameCache.set(asn, { value: "", expiresAt: Date.now() + ASN_NAME_FAILURE_TTL });
     return "";
   } finally {
     window.clearTimeout(timeout);
+    signal?.removeEventListener("abort", abort);
   }
+}
+
+async function fetchAsNames(asns, signal) {
+  const entries = [];
+  let nextIndex = 0;
+  const worker = async () => {
+    while (nextIndex < asns.length) {
+      const asn = asns[nextIndex];
+      nextIndex += 1;
+      entries.push([asn, await fetchAsName(asn, signal)]);
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(4, asns.length) }, worker));
+  return entries;
 }
 
 function RouteVisual({ query, result, labels, title, allPreferred = false }) {
@@ -711,19 +764,25 @@ function RouteVisual({ query, result, labels, title, allPreferred = false }) {
 
     setAsNames((current) => {
       const next = { ...current };
+      const now = Date.now();
       for (const asn of asns) {
-        if (!(asn in next)) next[asn] = asNameCache.has(asn) ? asNameCache.get(asn) : null;
+        const cached = asNameCache.get(asn);
+        if (!(asn in next)) next[asn] = cached && cached.expiresAt > now ? cached.value : null;
       }
       return next;
     });
 
-    Promise.all(asns.map(async (asn) => [asn, await fetchAsName(asn)])).then((entries) => {
+    const controller = new AbortController();
+    fetchAsNames(asns, controller.signal).then((entries) => {
       if (cancelled) return;
       setAsNames(Object.fromEntries(entries));
+    }).catch((error) => {
+      if (!cancelled && !isAbortError(error)) setAsNames((current) => ({ ...current }));
     });
 
     return () => {
       cancelled = true;
+      controller.abort();
     };
   }, [asns.join("|")]);
 
@@ -847,6 +906,13 @@ export default function App() {
   const protocolGeneration = useRef(0);
   const detailGeneration = useRef(0);
   const originGeneration = useRef(0);
+  const sessionAbort = useRef(null);
+  const nodesAbort = useRef(null);
+  const queryAbort = useRef(null);
+  const protocolAbort = useRef(null);
+  const detailAbort = useRef(null);
+  const originAbort = useRef(null);
+  const settingsProtocolAbort = useRef(new Map());
   const [protocolQuery, setProtocolQuery] = useState(null);
   const [protocolStatus, setProtocolStatus] = useState("ready");
   const [protocolError, setProtocolError] = useState("");
@@ -914,9 +980,10 @@ export default function App() {
   );
 
   async function loadSession() {
+    const controller = replaceAbortController(sessionAbort);
     setSessionLoading(true);
     try {
-      const { json } = await apiFetch("/api/session");
+      const { json } = await apiFetch("/api/session", { signal: controller.signal });
       setIsAdmin(Boolean(json.isAdmin));
       const nextSettings = {
         ...defaultSettings,
@@ -925,13 +992,22 @@ export default function App() {
       };
       setSettings(nextSettings);
       setDraftSettings({ ...nextSettings, apiToken: "" });
+    } catch (error) {
+      if (!isAbortError(error)) setNodesError(error.message || t.apiError);
+      throw error;
     } finally {
-      setSessionLoading(false);
+      if (sessionAbort.current === controller) {
+        finishAbortController(sessionAbort, controller);
+        setSessionLoading(false);
+      }
     }
   }
 
   async function loadNodes() {
+    const controller = replaceAbortController(nodesAbort);
     if (isDemo) {
+      finishAbortController(nodesAbort, controller);
+      setNodesLoading(false);
       setNodes([]);
       setActiveNodeRef("");
       setNodesError("");
@@ -948,7 +1024,9 @@ export default function App() {
       const seen = new Set();
       let cursor = "";
       for (let page = 0; page < 20; page += 1) {
-        const { json } = await apiFetch(`/api/nodes?limit=100${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ""}`);
+        const { json } = await apiFetch(`/api/nodes?limit=100${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ""}`, {
+          signal: controller.signal,
+        });
         for (const item of Array.isArray(json.items) ? json.items : []) {
           if (item?.node_ref && !seen.has(item.node_ref)) {
             seen.add(item.node_ref);
@@ -961,14 +1039,25 @@ export default function App() {
       }
       setNodes(items);
     } catch (error) {
-      setNodesError(error.message);
+      if (!isAbortError(error)) setNodesError(error.message);
     } finally {
-      setNodesLoading(false);
+      if (nodesAbort.current === controller) {
+        finishAbortController(nodesAbort, controller);
+        setNodesLoading(false);
+      }
     }
   }
 
   useEffect(() => {
-    loadSession();
+    loadSession().catch(() => {});
+  }, []);
+
+  useEffect(() => () => {
+    for (const ref of [sessionAbort, nodesAbort, queryAbort, protocolAbort, detailAbort, originAbort]) {
+      ref.current?.abort();
+    }
+    for (const controller of settingsProtocolAbort.current.values()) controller.abort();
+    settingsProtocolAbort.current.clear();
   }, []);
 
   useEffect(() => {
@@ -1026,6 +1115,10 @@ export default function App() {
     protocolGeneration.current += 1;
     detailGeneration.current += 1;
     originGeneration.current += 1;
+    queryAbort.current?.abort();
+    protocolAbort.current?.abort();
+    detailAbort.current?.abort();
+    originAbort.current?.abort();
     setActiveNodeRef(nodeRef);
     setSidebarOpen(false);
     setQuery(null);
@@ -1047,6 +1140,7 @@ export default function App() {
 
   function selectOperation(nextOperation) {
     queryGeneration.current += 1;
+    queryAbort.current?.abort();
     setOperation(nextOperation);
     setQuery(null);
     setQueryStatus("ready");
@@ -1054,13 +1148,13 @@ export default function App() {
     setProtocolDetailPage(null);
   }
 
-  async function pollQuery(queryId, firstDelayMs = 500, generation = queryGeneration.current) {
+  async function pollQuery(queryId, firstDelayMs = 500, generation = queryGeneration.current, signal = null) {
     let delay = firstDelayMs;
     const localDeadline = Date.now() + 90000;
     while (true) {
-      await new Promise((resolve) => window.setTimeout(resolve, delay));
+      if (!(await waitForDelay(delay, signal))) return null;
       if (generation !== queryGeneration.current) return null;
-      const { json, response } = await apiFetch(`/api/queries/${queryId}`);
+      const { json, response } = await apiFetch(`/api/queries/${queryId}`, { signal });
       if (generation !== queryGeneration.current) return null;
       setQuery(json);
       setQueryStatus(json.status);
@@ -1073,13 +1167,13 @@ export default function App() {
     }
   }
 
-  async function pollDetachedQuery(queryId, firstDelayMs, onUpdate, generationRef = null, generation = null) {
+  async function pollDetachedQuery(queryId, firstDelayMs, onUpdate, generationRef = null, generation = null, signal = null) {
     let delay = firstDelayMs;
     const localDeadline = Date.now() + 90000;
     while (true) {
-      await new Promise((resolve) => window.setTimeout(resolve, delay));
+      if (!(await waitForDelay(delay, signal))) return null;
       if (generationRef && generation !== generationRef.current) return null;
-      const { json, response } = await apiFetch(`/api/queries/${queryId}`);
+      const { json, response } = await apiFetch(`/api/queries/${queryId}`, { signal });
       if (generationRef && generation !== generationRef.current) return null;
       onUpdate(json);
       if (!["queued", "running"].includes(json.status)) return json;
@@ -1094,16 +1188,19 @@ export default function App() {
   async function loadProtocols(nodeOverride) {
     const generation = protocolGeneration.current + 1;
     protocolGeneration.current = generation;
+    const controller = replaceAbortController(protocolAbort);
     const selectedNode = nodeOverride || activeNode;
     setProtocolError("");
     setProtocolDetailQuery(null);
     setProtocolDetailStatus("ready");
     setActiveProtocolName("");
     if (!selectedNode?.online) {
+      finishAbortController(protocolAbort, controller);
       setProtocolError(t.offlineBlocked);
       return;
     }
     if (!selectedNode?.capabilities?.bird_protocols) {
+      finishAbortController(protocolAbort, controller);
       setProtocolError(t.protocolCapabilityBlocked);
       return;
     }
@@ -1111,7 +1208,9 @@ export default function App() {
       setProtocolStatus("queued");
       const { json, response } = await apiFetch(`/api/nodes/${selectedNode.node_ref}/bird/protocols:lookup`, {
         method: "POST",
+        signal: controller.signal,
       });
+      if (generation !== protocolGeneration.current) return;
       setProtocolQuery(json);
       setProtocolStatus(json.status);
       const retryAfter = Number(response.headers.get("Retry-After"));
@@ -1124,14 +1223,18 @@ export default function App() {
         },
         protocolGeneration,
         generation,
+        controller.signal,
       );
+      if (controller.signal.aborted) return;
       if (!finalQuery || finalQuery.status === "failed") {
         throw new Error(finalQuery?.error?.message || t.queryFailed);
       }
     } catch (error) {
-      if (generation !== protocolGeneration.current) return;
+      if (isAbortError(error) || generation !== protocolGeneration.current) return;
       setProtocolStatus("failed");
       setProtocolError(error.status === 429 ? t.rateLimited : error.message);
+    } finally {
+      finishAbortController(protocolAbort, controller);
     }
   }
 
@@ -1139,26 +1242,39 @@ export default function App() {
     if (!node?.online || !node?.capabilities?.bird_protocols) return;
     const nodeRef = node.node_ref;
     if (["queued", "running"].includes(settingsProtocolStatus[nodeRef])) return;
+    const previousController = settingsProtocolAbort.current.get(nodeRef);
+    previousController?.abort();
+    const controller = new AbortController();
+    settingsProtocolAbort.current.set(nodeRef, controller);
     setSettingsProtocolError((current) => ({ ...current, [nodeRef]: "" }));
     setSettingsProtocolStatus((current) => ({ ...current, [nodeRef]: "queued" }));
     try {
       const { json, response } = await apiFetch(`/api/nodes/${nodeRef}/bird/protocols:lookup`, {
         method: "POST",
+        signal: controller.signal,
       });
+      if (controller.signal.aborted) return;
       setSettingsProtocolStatus((current) => ({ ...current, [nodeRef]: json.status }));
       const retryAfter = Number(response.headers.get("Retry-After"));
       const finalQuery = await pollDetachedQuery(
         json.query_id,
         Number.isFinite(retryAfter) && retryAfter > 0 ? retryAfter * 1000 : 500,
         (next) => setSettingsProtocolStatus((current) => ({ ...current, [nodeRef]: next.status })),
+        null,
+        null,
+        controller.signal,
       );
+      if (controller.signal.aborted) return;
       if (!finalQuery || finalQuery.status === "failed") throw new Error(finalQuery?.error?.message || "Protocol query failed");
       const options = parseBirdProtocols(finalQuery?.result?.stdout || "");
       setSettingsProtocolOptions((current) => ({ ...current, [nodeRef]: options }));
       setSettingsProtocolStatus((current) => ({ ...current, [nodeRef]: finalQuery.status }));
     } catch (error) {
+      if (isAbortError(error)) return;
       setSettingsProtocolStatus((current) => ({ ...current, [nodeRef]: "failed" }));
       setSettingsProtocolError((current) => ({ ...current, [nodeRef]: error.message }));
+    } finally {
+      if (settingsProtocolAbort.current.get(nodeRef) === controller) settingsProtocolAbort.current.delete(nodeRef);
     }
   }
 
@@ -1177,13 +1293,16 @@ export default function App() {
     }
     const generation = detailGeneration.current + 1;
     detailGeneration.current = generation;
+    const controller = replaceAbortController(detailAbort);
     try {
       setProtocolDetailStatus("queued");
       setProtocolDetailQuery(null);
       const { json, response } = await apiFetch(`/api/nodes/${selectedNode.node_ref}/bird/protocols:lookup-detail`, {
         method: "POST",
         body: JSON.stringify({ protocol_name: protocolName }),
+        signal: controller.signal,
       });
+      if (generation !== detailGeneration.current) return;
       setProtocolDetailQuery(json);
       setProtocolDetailStatus(json.status);
       const retryAfter = Number(response.headers.get("Retry-After"));
@@ -1196,15 +1315,19 @@ export default function App() {
         },
         detailGeneration,
         generation,
+        controller.signal,
       );
+      if (controller.signal.aborted) return;
       if (!finalQuery || finalQuery.status === "failed") throw new Error(finalQuery?.error?.message || "Protocol detail query failed");
       const parsed = parseBirdProtocolDetail(finalQuery?.result?.stdout || "", protocol);
       setProtocolDetailPage({ node: selectedNode, protocol, query: finalQuery, parsed });
       setPage("protocol");
     } catch (error) {
-      if (detailGeneration.current !== generation) return;
+      if (isAbortError(error) || detailGeneration.current !== generation) return;
       setProtocolDetailStatus("failed");
       setProtocolError(error.status === 429 ? t.rateLimited : error.message);
+    } finally {
+      finishAbortController(detailAbort, controller);
     }
   }
 
@@ -1232,12 +1355,15 @@ export default function App() {
 
     const generation = originGeneration.current + 1;
     originGeneration.current = generation;
+    const controller = replaceAbortController(originAbort);
     try {
       setOriginRoutesStatus("queued");
       const { json, response } = await apiFetch(`/api/nodes/${node.node_ref}/bird/routes:lookup-origin-as`, {
         method: "POST",
         body: JSON.stringify({ asn: normalizedAsn }),
+        signal: controller.signal,
       });
+      if (generation !== originGeneration.current) return;
       setOriginRoutesQuery(json);
       setOriginRoutesStatus(json.status);
       const retryAfter = Number(response.headers.get("Retry-After"));
@@ -1250,14 +1376,18 @@ export default function App() {
         },
         originGeneration,
         generation,
+        controller.signal,
       );
+      if (controller.signal.aborted) return;
       if (!finalQuery || finalQuery.status === "failed") {
         throw new Error(finalQuery?.error?.message || t.queryFailed);
       }
     } catch (error) {
-      if (originGeneration.current !== generation) return;
+      if (isAbortError(error) || originGeneration.current !== generation) return;
       setOriginRoutesStatus("failed");
       setOriginRoutesError(error.status === 429 ? t.rateLimited : error.message);
+    } finally {
+      finishAbortController(originAbort, controller);
     }
   }
 
@@ -1321,25 +1451,31 @@ export default function App() {
       },
     }[operation];
 
+    const generation = queryGeneration.current + 1;
+    queryGeneration.current = generation;
+    const controller = replaceAbortController(queryAbort);
     try {
-      const generation = queryGeneration.current + 1;
-      queryGeneration.current = generation;
       setQuery(null);
       setQueryStatus("queued");
       const { json, response } = await apiFetch(queryConfig.path, {
         method: "POST",
         body: JSON.stringify(queryConfig.body),
+        signal: controller.signal,
       });
+      if (generation !== queryGeneration.current) return;
       setQuery(json);
       setQueryStatus(json.status);
       const retryAfter = Number(response.headers.get("Retry-After"));
-      const finalQuery = await pollQuery(json.query_id, Number.isFinite(retryAfter) && retryAfter > 0 ? retryAfter * 1000 : 500, generation);
+      const finalQuery = await pollQuery(json.query_id, Number.isFinite(retryAfter) && retryAfter > 0 ? retryAfter * 1000 : 500, generation, controller.signal);
       if (finalQuery?.status === "failed") {
         setQueryError(finalQuery.error?.message || t.queryFailed);
       }
     } catch (error) {
+      if (isAbortError(error) || generation !== queryGeneration.current) return;
       setQueryStatus("failed");
       setQueryError(error.status === 429 ? t.rateLimited : error.message);
+    } finally {
+      finishAbortController(queryAbort, controller);
     }
   }
 
@@ -1749,7 +1885,7 @@ export default function App() {
       ) : page === "protocol" && protocolDetailPage ? (
         <main className="protocol-page">
           <div className="protocol-page-actions">
-            <button className="back-button" type="button" onClick={() => { detailGeneration.current += 1; setPage("lg"); }}>
+            <button className="back-button" type="button" onClick={() => { detailGeneration.current += 1; detailAbort.current?.abort(); setPage("lg"); }}>
               <ArrowLeft size={16} />
               <span>{t.backToLookingGlass}</span>
             </button>
@@ -2245,6 +2381,7 @@ export default function App() {
                 type="button"
                 onClick={() => {
                   originGeneration.current += 1;
+                  originAbort.current?.abort();
                   setOriginRoutesOpen(false);
                   setOriginRoutesError("");
                 }}

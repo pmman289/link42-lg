@@ -129,7 +129,7 @@ http://127.0.0.1:8000
 检查健康状态：
 
 ```bash
-curl -fsS http://127.0.0.1:8000/api/session
+curl -fsS http://127.0.0.1:8000/healthz
 ```
 
 ## 6. Docker Compose 示例
