@@ -1,5 +1,6 @@
 import asyncio
 import os
+import socket
 import tempfile
 import time
 import unittest
@@ -7,6 +8,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import httpx
+from fastapi.testclient import TestClient
 
 
 class BackendTest(unittest.TestCase):
@@ -108,6 +110,38 @@ class BackendTest(unittest.TestCase):
             self.main.normalize_api_base("http://127.0.0.1:8080"),
             "http://127.0.0.1:8080/third-party-api/looking-glass/v1",
         )
+
+    def test_settings_save_and_readback_work_without_dns(self):
+        original = self.main.get_settings()
+        cases = (
+            "https://controller.example.invalid",
+            "http://controller.dn42:8080",
+            "http://172.20.177.1:8080",
+            "http://[fd00::1]:8080/third-party-api/looking-glass/v1/",
+        )
+        try:
+            with TestClient(self.main.app) as client:
+                self.assertEqual(client.post("/api/auth/login", json={"password": "unit-test-password"}).status_code, 200)
+                for api_base in cases:
+                    with self.subTest(api_base=api_base):
+                        self.main.save_settings({**original, "apiBase": "", "apiToken": "", "pinnedApiHost": ""})
+                        with patch.object(self.main, "API_ALLOWED_HOSTS", set()), patch(
+                            "socket.getaddrinfo", side_effect=socket.gaierror("DNS unavailable")
+                        ) as resolve:
+                            saved = client.put("/api/admin/settings", json={"apiBase": api_base, "apiToken": "test-token"})
+                            self.assertEqual(saved.status_code, 200, saved.text)
+                            resolve.assert_not_called()
+                        readback = client.get("/api/admin/settings")
+                        self.assertEqual(readback.status_code, 200)
+                        self.assertEqual(readback.json()["apiBase"], self.main.normalize_api_base(api_base))
+                        self.assertTrue(readback.json()["apiTokenSet"])
+        finally:
+            self.main.save_settings(original)
+
+    def test_api_base_rejects_invalid_hosts_without_dns_validation(self):
+        for value in ("https://bad host", "https://bad_host", "https://example.com\n.evil.test", "https://[invalid]"):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                self.main.normalize_api_base(value)
 
     def test_clearing_api_base_does_not_clear_host_pin(self):
         if self.main.API_ALLOWED_HOSTS:

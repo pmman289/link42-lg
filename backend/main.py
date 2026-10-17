@@ -6,7 +6,6 @@ import os
 import ipaddress
 import re
 import secrets
-import socket
 import sqlite3
 import threading
 import time
@@ -342,6 +341,8 @@ def normalize_api_base(value: str) -> str:
     trimmed = (value or "").strip().rstrip("/")
     if not trimmed:
         return ""
+    if any(char.isspace() or ord(char) < 32 or ord(char) == 127 for char in trimmed):
+        raise ValueError("API Base must not contain whitespace or control characters")
     parsed = urlsplit(trimmed)
     scheme = parsed.scheme.lower()
     if scheme not in {"http", "https"}:
@@ -353,6 +354,11 @@ def normalize_api_base(value: str) -> str:
     except ValueError as exc:
         raise ValueError("API Base has an invalid port") from exc
     host = parsed.hostname.encode("idna").decode("ascii").lower().rstrip(".")
+    try:
+        ipaddress.ip_address(host)
+    except ValueError:
+        if not DOMAIN_RE.fullmatch(host):
+            raise ValueError("API Base must contain a valid IP address or hostname")
     netloc = f"[{host}]" if ":" in host else host
     default_port = 443 if scheme == "https" else 80
     if port and port != default_port:
@@ -401,13 +407,6 @@ async def validate_api_base(value: str, *, allow_empty: bool = False) -> str:
     host = parsed.hostname or ""
     if not api_host_is_allowed(host):
         raise HTTPException(status_code=400, detail={"code": "api_host_not_allowed", "message": "API Base host is not trusted"})
-    try:
-        default_port = 443 if parsed.scheme == "https" else 80
-        addresses = await asyncio.to_thread(socket.getaddrinfo, host, parsed.port or default_port, type=socket.SOCK_STREAM)
-    except socket.gaierror as exc:
-        raise HTTPException(status_code=400, detail={"code": "api_host_unresolvable", "message": "API Base host could not be resolved"}) from exc
-    if not addresses:
-        raise HTTPException(status_code=400, detail={"code": "api_host_unresolvable", "message": "API Base host could not be resolved"})
     return normalized
 
 

@@ -183,6 +183,8 @@ API Base 支持 HTTP 和 HTTPS，也允许解析到私网、回环及 DN42 地�
 
 使用私网 IP 作为 API Base 且配置了 `LG_API_ALLOWED_HOSTS` 时，需要将该 IP 加入白名单；也可以在首次配置时不设置白名单，让应用锁定首次保存的主机。
 
+保存 API Base 时仅校验地址格式和允许的主机，不要求 DNS 或上游服务当前可用。实际加载节点、执行查询时才连接 API；DNS/连接失败会显示上游不可用错误。若保存提示域名不允许，请检查 `LG_API_ALLOWED_HOSTS`；已锁定的域名即使清空地址也不会解锁，更换域名需将新主机加入该环境变量并重启服务。
+
 路由查询、ping 和 traceroute 均允许私网及 DN42 IPv4/IPv6 地址；ping 和 traceroute 同时允许内部域名。
 
 ## 本地开发
