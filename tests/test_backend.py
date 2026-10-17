@@ -143,6 +143,38 @@ class BackendTest(unittest.TestCase):
             with self.subTest(value=value), self.assertRaises(ValueError):
                 self.main.normalize_api_base(value)
 
+    def test_http_api_save_and_request_preserve_scheme(self):
+        original = self.main.get_settings()
+        api_base = "http://172.20.0.10:8000"
+        requests = []
+
+        def handle_upstream(request):
+            requests.append(request)
+            return httpx.Response(200, json={"items": [], "next_cursor": None})
+
+        async def query_nodes():
+            async with httpx.AsyncClient(transport=httpx.MockTransport(handle_upstream)) as upstream:
+                with patch.object(self.main, "get_upstream_client", return_value=upstream):
+                    return await self.main.link42_request("/nodes")
+
+        try:
+            with patch.object(self.main, "API_ALLOWED_HOSTS", {"172.20.0.10"}):
+                with TestClient(self.main.app) as client:
+                    self.assertEqual(client.post("/api/auth/login", json={"password": "unit-test-password"}).status_code, 200)
+                    with self.assertLogs("uvicorn.error", level="WARNING") as logs:
+                        saved = client.put("/api/admin/settings", json={"apiBase": api_base, "apiToken": "http-test-token"})
+                    self.assertEqual(saved.status_code, 200, saved.text)
+                    self.assertEqual(saved.json()["apiBase"], api_base + self.main.API_PATH)
+                    self.assertTrue(any("unencrypted HTTP" in message for message in logs.output))
+                    payload, response = asyncio.run(query_nodes())
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(payload["items"], [])
+                self.assertEqual(len(requests), 1)
+                self.assertEqual(str(requests[0].url), api_base + self.main.API_PATH + "/nodes")
+                self.assertEqual(requests[0].headers["Authorization"], "Bearer http-test-token")
+        finally:
+            self.main.save_settings(original)
+
     def test_clearing_api_base_does_not_clear_host_pin(self):
         if self.main.API_ALLOWED_HOSTS:
             self.skipTest("host migration allowlist is configured for this environment")
