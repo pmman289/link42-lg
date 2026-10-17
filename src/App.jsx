@@ -124,6 +124,8 @@ const copy = {
     allRegions: "全部地域",
     unknownRegion: "未知地域",
     saveSettings: "保存设置",
+    savingSettings: "正在保存",
+    settingsSaveTimeout: "保存请求超时，请检查服务连接后重试。",
     saved: "已保存设置",
     saveFailed: "保存失败，请检查配置后重试",
     clearToken: "清除 Token",
@@ -295,6 +297,8 @@ const copy = {
     allRegions: "All regions",
     unknownRegion: "Unknown region",
     saveSettings: "Save settings",
+    savingSettings: "Saving",
+    settingsSaveTimeout: "Saving timed out. Check the server connection and retry.",
     saved: "Settings saved",
     saveFailed: "Save failed. Check the configuration and try again.",
     clearToken: "Clear Token",
@@ -512,7 +516,10 @@ async function apiFetch(path, options = {}) {
     ...options.headers,
   };
   const response = await fetch(path, { ...options, headers, credentials: "include" });
-  const json = await response.json().catch(() => ({}));
+  const json = await response.json().catch((error) => {
+    if (isAbortError(error)) throw error;
+    return {};
+  });
   if (!response.ok) {
     const detail = json?.detail || json?.error;
     const message = detail?.message || json?.error?.message || response.statusText || "Request failed";
@@ -1578,33 +1585,36 @@ export default function App() {
     setSettingsError("");
     setSettingsSaved(false);
     setSettingsSaving(true);
-    const payload = {
-      title: draftSettings.title.trim() || "Link42 Looking Glass",
-      apiBase: draftSettings.apiBase.trim(),
-      apiToken: draftSettings.apiToken.trim(),
-      clearApiToken: tokenClearRequested,
-      publicNodeRefs: draftSettings.publicNodeRefs,
-      nodeOverrides: draftSettings.nodeOverrides || {},
-      publicProtocols: draftSettings.publicProtocols || {},
-    };
+    const controller = new AbortController();
+    const timeout = window.setTimeout(() => controller.abort(), 15000);
     try {
+      const payload = {
+        title: draftSettings.title.trim() || "Link42 Looking Glass",
+        apiBase: draftSettings.apiBase.trim(),
+        apiToken: draftSettings.apiToken.trim(),
+        clearApiToken: tokenClearRequested,
+        publicNodeRefs: draftSettings.publicNodeRefs,
+        nodeOverrides: draftSettings.nodeOverrides || {},
+        publicProtocols: draftSettings.publicProtocols || {},
+      };
       const { json } = await apiFetch("/api/admin/settings", {
         method: "PUT",
         body: JSON.stringify(payload),
+        signal: controller.signal,
       });
       const next = { ...defaultSettings, ...json, configured: Boolean(json.apiBase && json.apiTokenSet) };
       setSettings(next);
       setDraftSettings({ ...next, apiToken: "" });
       setTokenClearRequested(false);
       setSettingsSaved(true);
-      window.setTimeout(() => setSettingsSaved(false), 1600);
     } catch (error) {
       const configurationErrors = {
         api_host_not_allowed: t.apiHostNotAllowed,
         invalid_api_base: t.invalidApiBase,
       };
-      setSettingsError(configurationErrors[error.code] || (error.status === 429 ? t.rateLimited : error.message || t.saveFailed));
+      setSettingsError(isAbortError(error) ? t.settingsSaveTimeout : configurationErrors[error.code] || (error.status === 429 ? t.rateLimited : error.message || t.saveFailed));
     } finally {
+      window.clearTimeout(timeout);
       setSettingsSaving(false);
     }
   }
@@ -1681,7 +1691,7 @@ export default function App() {
             </span>
             {isAdmin ? (
               <>
-                <button className="text-icon-button" onClick={() => setPage((current) => (current === "admin" ? "lg" : "admin"))}>
+                <button className="text-icon-button" aria-label={t.admin} onClick={() => setPage((current) => (current === "admin" ? "lg" : "admin"))}>
                   <Settings2 size={16} />
                   <span>{t.admin}</span>
                 </button>
@@ -1722,9 +1732,8 @@ export default function App() {
                 <h2>{t.settings}</h2>
                 <p>{t.settingsHint}</p>
               </div>
-              {settingsSaved && <span className="saved-pill">{t.saved}</span>}
             </div>
-            <form className="settings-form" onSubmit={saveSettings}>
+            <form className="settings-form" onSubmit={saveSettings} onChange={() => setSettingsSaved(false)} aria-busy={settingsSaving}>
               <label>
                 <span>{t.customTitle}</span>
                 <input
@@ -1761,7 +1770,10 @@ export default function App() {
                     type="button"
                     className="text-icon-button danger-action"
                     onClick={() => {
-                      if (window.confirm(t.clearTokenConfirm)) setTokenClearRequested(true);
+                      if (window.confirm(t.clearTokenConfirm)) {
+                        setSettingsSaved(false);
+                        setTokenClearRequested(true);
+                      }
                     }}
                   >
                     <X size={14} />
@@ -1778,11 +1790,11 @@ export default function App() {
                   <div>
                     <button
                       type="button"
-                      onClick={() => setDraftSettings((current) => ({ ...current, publicNodeRefs: nodes.map((node) => node.node_ref) }))}
+                      onClick={() => { setSettingsSaved(false); setDraftSettings((current) => ({ ...current, publicNodeRefs: nodes.map((node) => node.node_ref) })); }}
                     >
                       {t.selectAll}
                     </button>
-                    <button type="button" onClick={() => setDraftSettings((current) => ({ ...current, publicNodeRefs: [] }))}>
+                    <button type="button" onClick={() => { setSettingsSaved(false); setDraftSettings((current) => ({ ...current, publicNodeRefs: [] })); }}>
                       {t.clearAll}
                     </button>
                   </div>
@@ -1901,10 +1913,13 @@ export default function App() {
               </div>
               {settingsError && <p role="alert" className="form-error">{settingsError}</p>}
               <p className="security-note">{t.frontendSecurityHint}</p>
-              <button className="save-button" type="submit" disabled={settingsSaving}>
-                {settingsSaving ? <Loader2 className="spin" size={15} /> : <Save size={15} />}
-                {settingsSaving ? t.running : t.saveSettings}
-              </button>
+              <div className="settings-save-actions">
+                <button className="save-button" type="submit" disabled={settingsSaving}>
+                  {settingsSaving ? <Loader2 className="spin" size={15} /> : <Save size={15} />}
+                  {settingsSaving ? t.savingSettings : t.saveSettings}
+                </button>
+                {settingsSaved && <span role="status" className="saved-pill"><CheckCircle2 size={14} />{t.saved}</span>}
+              </div>
             </form>
           </section>
         </main>

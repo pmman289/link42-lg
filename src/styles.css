@@ -571,6 +571,17 @@ a {
   gap: 14px;
 }
 
+.settings-save-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 12px;
+}
+
+.settings-save-actions .saved-pill {
+  gap: 6px;
+}
+
 .settings-form > label {
   display: flex;
   flex-direction: column;
