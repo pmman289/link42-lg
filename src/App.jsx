@@ -102,7 +102,6 @@ const copy = {
     customTitle: "页面标题",
     apiBase: "API 地址",
     apiBaseHint: "支持 HTTP、HTTPS 和私网地址，例如 http://172.20.0.10:8000 或 https://link42.pmman.tech；也可填写完整 /third-party-api/looking-glass/v1 地址。",
-    apiHostNotAllowed: "API 域名不在允许范围内，或与首次保存的域名不同。请在部署环境的 LG_API_ALLOWED_HOSTS 中加入新域名，重启服务后再保存。",
     invalidApiBase: "API 地址格式无效，请填写 http:// 或 https:// 开头的站点根地址，或完整的 /third-party-api/looking-glass/v1 地址。",
     apiToken: "API Token",
     apiTokenPlaceholder: "l42lg_xxx_xxx",
@@ -275,7 +274,6 @@ const copy = {
     customTitle: "Page title",
     apiBase: "API URL",
     apiBaseHint: "HTTP, HTTPS, and private addresses are supported, such as http://172.20.0.10:8000 or https://link42.pmman.tech, or a full /third-party-api/looking-glass/v1 URL.",
-    apiHostNotAllowed: "The API host is outside the allowlist or differs from the first saved host. Add the new host to LG_API_ALLOWED_HOSTS in your deployment and restart the service before saving.",
     invalidApiBase: "Invalid API URL. Enter an http:// or https:// site origin, or the full /third-party-api/looking-glass/v1 URL.",
     apiToken: "API Token",
     apiTokenPlaceholder: "l42lg_xxx_xxx",
@@ -1609,7 +1607,6 @@ export default function App() {
       setSettingsSaved(true);
     } catch (error) {
       const configurationErrors = {
-        api_host_not_allowed: t.apiHostNotAllowed,
         invalid_api_base: t.invalidApiBase,
       };
       setSettingsError(isAbortError(error) ? t.settingsSaveTimeout : configurationErrors[error.code] || (error.status === 429 ? t.rateLimited : error.message || t.saveFailed));

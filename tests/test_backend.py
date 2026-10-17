@@ -124,10 +124,7 @@ class BackendTest(unittest.TestCase):
                 self.assertEqual(client.post("/api/auth/login", json={"password": "unit-test-password"}).status_code, 200)
                 for api_base in cases:
                     with self.subTest(api_base=api_base):
-                        self.main.save_settings({**original, "apiBase": "", "apiToken": "", "pinnedApiHost": ""})
-                        with patch.object(self.main, "API_ALLOWED_HOSTS", set()), patch(
-                            "socket.getaddrinfo", side_effect=socket.gaierror("DNS unavailable")
-                        ) as resolve:
+                        with patch("socket.getaddrinfo", side_effect=socket.gaierror("DNS unavailable")) as resolve:
                             saved = client.put("/api/admin/settings", json={"apiBase": api_base, "apiToken": "test-token"})
                             self.assertEqual(saved.status_code, 200, saved.text)
                             resolve.assert_not_called()
@@ -158,69 +155,98 @@ class BackendTest(unittest.TestCase):
                     return await self.main.link42_request("/nodes")
 
         try:
-            with patch.object(self.main, "API_ALLOWED_HOSTS", {"172.20.0.10"}):
-                with TestClient(self.main.app) as client:
-                    self.assertEqual(client.post("/api/auth/login", json={"password": "unit-test-password"}).status_code, 200)
-                    with self.assertLogs("uvicorn.error", level="WARNING") as logs:
-                        saved = client.put("/api/admin/settings", json={"apiBase": api_base, "apiToken": "http-test-token"})
-                    self.assertEqual(saved.status_code, 200, saved.text)
-                    self.assertEqual(saved.json()["apiBase"], api_base + self.main.API_PATH)
-                    self.assertTrue(any("unencrypted HTTP" in message for message in logs.output))
-                    payload, response = asyncio.run(query_nodes())
-                self.assertEqual(response.status_code, 200)
-                self.assertEqual(payload["items"], [])
-                self.assertEqual(len(requests), 1)
-                self.assertEqual(str(requests[0].url), api_base + self.main.API_PATH + "/nodes")
-                self.assertEqual(requests[0].headers["Authorization"], "Bearer http-test-token")
+            with TestClient(self.main.app) as client:
+                self.assertEqual(client.post("/api/auth/login", json={"password": "unit-test-password"}).status_code, 200)
+                with self.assertLogs("uvicorn.error", level="WARNING") as logs:
+                    saved = client.put("/api/admin/settings", json={"apiBase": api_base, "apiToken": "http-test-token"})
+                self.assertEqual(saved.status_code, 200, saved.text)
+                self.assertEqual(saved.json()["apiBase"], api_base + self.main.API_PATH)
+                self.assertTrue(any("unencrypted HTTP" in message for message in logs.output))
+                payload, response = asyncio.run(query_nodes())
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(payload["items"], [])
+            self.assertEqual(len(requests), 1)
+            self.assertEqual(str(requests[0].url), api_base + self.main.API_PATH + "/nodes")
+            self.assertEqual(requests[0].headers["Authorization"], "Bearer http-test-token")
         finally:
             self.main.save_settings(original)
 
-    def test_clearing_api_base_does_not_clear_host_pin(self):
-        if self.main.API_ALLOWED_HOSTS:
-            self.skipTest("host migration allowlist is configured for this environment")
+    def test_api_host_can_change_after_clearing_base(self):
         original = self.main.get_settings()
-        session_id = "host-pin-test-session"
-        with self.main.connect_db() as db:
-            db.execute(
-                "update settings set api_base = ?, api_token = ?, pinned_api_host = ? where id = 1",
-                ("http://127.0.0.1:18001", "old-token", "127.0.0.1"),
-            )
-            db.execute("insert or replace into sessions (session_id, created_at) values (?, ?)", (session_id, int(time.time())))
         try:
-            asyncio.run(self.main.update_admin_settings(self.main.SettingsBody(apiBase=""), session_id))
-            with self.assertRaises(self.main.HTTPException) as rejected:
-                asyncio.run(self.main.update_admin_settings(self.main.SettingsBody(apiBase="http://localhost:18001"), session_id))
-            self.assertEqual(rejected.exception.status_code, 400)
-            self.assertEqual(rejected.exception.detail["code"], "api_host_not_allowed")
+            self.main.save_settings({**original, "apiBase": "https://old.example", "apiToken": "old-token"})
+            with TestClient(self.main.app) as client:
+                self.assertEqual(client.post("/api/auth/login", json={"password": "unit-test-password"}).status_code, 200)
+                cleared = client.put("/api/admin/settings", json={"apiBase": ""})
+                self.assertEqual(cleared.status_code, 200, cleared.text)
+                self.assertFalse(cleared.json()["apiTokenSet"])
+                saved = client.put("/api/admin/settings", json={"apiBase": "http://localhost:18001", "apiToken": "new-token"})
+                self.assertEqual(saved.status_code, 200, saved.text)
+                self.assertTrue(saved.json()["apiTokenSet"])
         finally:
             self.main.save_settings(original)
-            with self.main.connect_db() as db:
-                db.execute("delete from sessions where session_id = ?", (session_id,))
 
-    def test_allowlisted_host_migration_repins_and_requires_new_token(self):
+    def test_legacy_host_pin_and_allowlist_do_not_restrict_api_changes(self):
         original = self.main.get_settings()
-        session_id = "host-migration-test-session"
         with self.main.connect_db() as db:
-            db.execute(
-                "update settings set api_base = ?, api_token = ?, pinned_api_host = ? where id = 1",
-                ("http://127.0.0.1:18001", "old-token", "127.0.0.1"),
-            )
-            db.execute("insert or replace into sessions (session_id, created_at) values (?, ?)", (session_id, int(time.time())))
+            columns = {row["name"] for row in db.execute("pragma table_info(settings)").fetchall()}
+            if "pinned_api_host" not in columns:
+                db.execute("alter table settings add column pinned_api_host text not null default ''")
+            db.execute("update settings set pinned_api_host = ? where id = 1", ("old.example",))
         try:
-            with patch.object(self.main, "API_ALLOWED_HOSTS", {"localhost"}):
-                result = asyncio.run(
-                    self.main.update_admin_settings(
-                        self.main.SettingsBody(apiBase="http://localhost:18001", apiToken="new-token"),
-                        session_id,
-                    )
-                )
-            self.assertEqual(result["apiBase"], "http://localhost:18001/third-party-api/looking-glass/v1")
-            self.assertTrue(result["apiTokenSet"])
-            self.assertEqual(self.main.get_settings()["pinnedApiHost"], "localhost")
+            self.main.save_settings({**original, "apiBase": "https://old.example", "apiToken": "old-token"})
+            with patch.dict(os.environ, {"LG_API_ALLOWED_HOSTS": "old.example"}), TestClient(self.main.app) as client:
+                self.assertEqual(client.post("/api/auth/login", json={"password": "unit-test-password"}).status_code, 200)
+                saved = client.put("/api/admin/settings", json={"apiBase": "http://new.dn42:8000"})
+                self.assertEqual(saved.status_code, 200, saved.text)
+                self.assertEqual(saved.json()["apiBase"], "http://new.dn42:8000" + self.main.API_PATH)
+                self.assertFalse(saved.json()["apiTokenSet"])
+                self.assertEqual(self.main.get_settings()["apiToken"], "")
+                saved = client.put("/api/admin/settings", json={"apiBase": "https://another.example", "apiToken": "new-token"})
+                self.assertEqual(saved.status_code, 200, saved.text)
+                self.assertTrue(saved.json()["apiTokenSet"])
+                self.assertEqual(self.main.get_settings()["apiToken"], "new-token")
         finally:
             self.main.save_settings(original)
             with self.main.connect_db() as db:
-                db.execute("delete from sessions where session_id = ?", (session_id,))
+                db.execute("update settings set pinned_api_host = '' where id = 1")
+
+    def test_token_preserved_only_for_unchanged_api_source(self):
+        original = self.main.get_settings()
+        original_base = "https://controller.example"
+        try:
+            with TestClient(self.main.app) as client:
+                self.assertEqual(client.post("/api/auth/login", json={"password": "unit-test-password"}).status_code, 200)
+                for api_base, expected_token in (
+                    (original_base + ":443" + self.main.API_PATH + "/", "old-token"),
+                    ("http://controller.example", ""),
+                    (original_base + ":8443", ""),
+                    ("https://other.example", ""),
+                ):
+                    with self.subTest(api_base=api_base):
+                        self.main.save_settings({**original, "apiBase": original_base, "apiToken": "old-token"})
+                        saved = client.put("/api/admin/settings", json={"apiBase": api_base, "apiToken": ""})
+                        self.assertEqual(saved.status_code, 200, saved.text)
+                        self.assertEqual(self.main.get_settings()["apiToken"], expected_token)
+        finally:
+            self.main.save_settings(original)
+
+    def test_api_settings_still_require_admin_and_valid_url(self):
+        original = self.main.get_settings()
+        try:
+            with TestClient(self.main.app) as client:
+                denied = client.put("/api/admin/settings", json={"apiBase": "http://new.dn42"})
+                self.assertEqual(denied.status_code, 401)
+                self.assertEqual(self.main.get_settings(), original)
+                self.assertEqual(client.post("/api/auth/login", json={"password": "unit-test-password"}).status_code, 200)
+                for api_base in ("file:///etc/passwd", "ftp://example.com", "http://user:password@example.com", "http://bad host"):
+                    with self.subTest(api_base=api_base):
+                        rejected = client.put("/api/admin/settings", json={"apiBase": api_base})
+                        self.assertEqual(rejected.status_code, 400, rejected.text)
+                        self.assertEqual(rejected.json()["detail"]["code"], "invalid_api_base")
+                        self.assertEqual(self.main.get_settings(), original)
+        finally:
+            self.main.save_settings(original)
 
     def test_query_slots_limit_each_owner_and_allow_second_visitor(self):
         owner_a = self.main.query_owner_hash("visitor-a")

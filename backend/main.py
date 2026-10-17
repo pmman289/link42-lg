@@ -35,11 +35,6 @@ MAX_REQUEST_BODY_BYTES = max(1024, int(os.getenv("LG_MAX_REQUEST_BODY_BYTES", st
 MAX_NODE_PAGES = max(1, int(os.getenv("LG_MAX_NODE_PAGES", "20")))
 MAX_PUBLIC_NODES = max(1, int(os.getenv("LG_MAX_PUBLIC_NODES", "2000")))
 PER_CLIENT_NODE_CONCURRENCY_LIMIT = max(1, int(os.getenv("LG_PER_CLIENT_NODE_CONCURRENCY_LIMIT", "1")))
-API_ALLOWED_HOSTS = {
-    host.strip().lower().rstrip(".")
-    for host in os.getenv("LG_API_ALLOWED_HOSTS", "").split(",")
-    if host.strip()
-}
 LOCAL_QUERY_DEADLINE_SECONDS = 90
 LOCAL_DEADLINE_CLOCK_SKEW_SECONDS = 5
 TERMINAL_QUERY_STATUSES = {"succeeded", "failed", "expired", "cancelled"}
@@ -210,8 +205,7 @@ def init_db() -> None:
               api_token text not null,
               public_node_refs text not null,
               node_overrides text not null default '{}',
-              public_protocols text not null default '{}',
-              pinned_api_host text not null default ''
+              public_protocols text not null default '{}'
             );
             create table if not exists sessions (
               session_id text primary key,
@@ -247,8 +241,6 @@ def init_db() -> None:
             db.execute("alter table settings add column node_overrides text not null default '{}'")
         if "public_protocols" not in columns:
             db.execute("alter table settings add column public_protocols text not null default '{}'")
-        if "pinned_api_host" not in columns:
-            db.execute("alter table settings add column pinned_api_host text not null default ''")
         slot_columns = {row["name"] for row in db.execute("pragma table_info(query_slots)").fetchall()}
         if "owner_hash" not in slot_columns:
             db.execute("alter table query_slots add column owner_hash text")
@@ -263,7 +255,7 @@ def init_db() -> None:
         row = db.execute("select id from settings where id = 1").fetchone()
         if row is None:
             db.execute(
-                "insert into settings (id, title, api_base, api_token, public_node_refs, node_overrides, public_protocols, pinned_api_host) values (1, ?, ?, ?, ?, ?, ?, ?)",
+                "insert into settings (id, title, api_base, api_token, public_node_refs, node_overrides, public_protocols) values (1, ?, ?, ?, ?, ?, ?)",
                 (
                     "Link42 Looking Glass",
                     os.getenv("LG_API_BASE") or "",
@@ -271,16 +263,8 @@ def init_db() -> None:
                     "[]",
                     "{}",
                     "{}",
-                    "",
                 ),
             )
-        row = db.execute("select api_base, pinned_api_host from settings where id = 1").fetchone()
-        if row and not row["pinned_api_host"] and row["api_base"]:
-            try:
-                parsed = urlsplit(normalize_api_base(row["api_base"]))
-                db.execute("update settings set pinned_api_host = ? where id = 1", (parsed.hostname or "",))
-            except ValueError:
-                pass
         now = int(time.time())
         db.execute("delete from sessions where created_at < ?", (now - SESSION_TTL_SECONDS,))
         db.execute("delete from query_access where created_at < ?", (now - 60 * 60,))
@@ -313,7 +297,6 @@ def get_settings() -> dict[str, Any]:
         "publicNodeRefs": refs if isinstance(refs, list) else [],
         "nodeOverrides": overrides if isinstance(overrides, dict) else {},
         "publicProtocols": protocols if isinstance(protocols, dict) else {},
-        "pinnedApiHost": row["pinned_api_host"] if "pinned_api_host" in row.keys() else "",
     }
 
 
@@ -322,7 +305,7 @@ def save_settings(settings: dict[str, Any]) -> None:
         db.execute(
             """
             update settings
-            set title = ?, api_base = ?, api_token = ?, public_node_refs = ?, node_overrides = ?, public_protocols = ?, pinned_api_host = ?
+            set title = ?, api_base = ?, api_token = ?, public_node_refs = ?, node_overrides = ?, public_protocols = ?
             where id = 1
             """,
             (
@@ -332,7 +315,6 @@ def save_settings(settings: dict[str, Any]) -> None:
                 json.dumps(settings["publicNodeRefs"], ensure_ascii=False),
                 json.dumps(settings["nodeOverrides"], ensure_ascii=False),
                 json.dumps(settings["publicProtocols"], ensure_ascii=False),
-                settings.get("pinnedApiHost", ""),
             ),
         )
 
@@ -381,16 +363,6 @@ def warn_if_insecure_api_base(value: str) -> None:
         )
 
 
-def api_host_is_allowed(host: str) -> bool:
-    if not API_ALLOWED_HOSTS:
-        return True
-    return any(
-        host == pattern
-        or (pattern.startswith("*.") and host.endswith(pattern[1:]) and host != pattern[2:])
-        for pattern in API_ALLOWED_HOSTS
-    )
-
-
 async def validate_api_base(value: str, *, allow_empty: bool = False) -> str:
     try:
         normalized = normalize_api_base(value)
@@ -403,10 +375,6 @@ async def validate_api_base(value: str, *, allow_empty: bool = False) -> str:
         if allow_empty:
             return ""
         raise HTTPException(status_code=409, detail={"code": "api_not_configured", "message": "Looking Glass API is not configured"})
-    parsed = urlsplit(normalized)
-    host = parsed.hostname or ""
-    if not api_host_is_allowed(host):
-        raise HTTPException(status_code=400, detail={"code": "api_host_not_allowed", "message": "API Base host is not trusted"})
     return normalized
 
 
@@ -1095,13 +1063,6 @@ async def update_admin_settings(body: SettingsBody, lg_admin_session: str | None
     except ValueError:
         current_api_base = ""
     api_base = await validate_api_base(body.apiBase, allow_empty=True)
-    current_host = (urlsplit(current_api_base).hostname or "").lower() if current_api_base else ""
-    next_host = (urlsplit(api_base).hostname or "").lower() if api_base else ""
-    pinned_host = current.get("pinnedApiHost") or current_host
-    if api_base and pinned_host and next_host != pinned_host and not API_ALLOWED_HOSTS:
-        raise HTTPException(status_code=400, detail={"code": "api_host_not_allowed", "message": "Changing the API host requires LG_API_ALLOWED_HOSTS to include the new host"})
-    if api_base and pinned_host and next_host != pinned_host and API_ALLOWED_HOSTS:
-        pinned_host = next_host
     source_changed = api_base != current_api_base
     token = ""
     if body.clearApiToken:
@@ -1119,7 +1080,6 @@ async def update_admin_settings(body: SettingsBody, lg_admin_session: str | None
         "publicNodeRefs": [str(ref) for ref in body.publicNodeRefs if RESOURCE_ID_RE.fullmatch(str(ref))],
         "nodeOverrides": clean_node_overrides(body.nodeOverrides),
         "publicProtocols": clean_public_protocols(body.publicProtocols),
-        "pinnedApiHost": pinned_host or next_host,
     }
     warn_if_insecure_api_base(api_base)
     save_settings(next_settings)

@@ -38,7 +38,6 @@ LG_DB_PATH=/app/data/looking-glass.sqlite3
 ```text
 LG_ADMIN_PASSWORD=replace-with-a-long-random-password
 LG_COOKIE_SECURE=auto
-LG_API_ALLOWED_HOSTS=link42.example.com
 LG_NODE_CONCURRENCY_LIMIT=2
 LG_API_BASE=https://link42.example.com
 LG_API_TOKEN=l42lg_xxx_xxx
@@ -46,7 +45,7 @@ LG_API_TOKEN=l42lg_xxx_xxx
 
 `LG_API_BASE` 和 `LG_API_TOKEN` 只在首次初始化数据库时写入默认设置；后续以管理页和 SQLite 中的配置为准。
 
-`LG_API_ALLOWED_HOSTS` 用于固定 API Base 的可信域名，支持逗号分隔和 `*.example.com`。未设置时首次保存的 API 域名会被锁定，后续更换域名需要先配置白名单。API 来源变化时应用会清除旧 Token。API Base 支持 HTTP、HTTPS 和私网/DN42 地址；HTTP 会在日志中产生 Token 明文传输警告。
+API Base 无域名白名单或首次主机锁定，管理员可直接在管理页更换地址。API 来源变化时应用会清除旧 Token，除非同时显式填写新 Token。API Base 支持 HTTP、HTTPS 和私网/DN42 地址；HTTP 会在日志中产生 Token 明文传输警告。旧部署中的 `LG_API_ALLOWED_HOSTS` 环境变量已不再生效，可以移除；旧数据库无需清空或重建。
 
 ## 2. 构建前检查
 
@@ -114,7 +113,6 @@ docker run --rm \
   -p 127.0.0.1:8000:8000 \
   -e LG_ADMIN_PASSWORD='replace-with-a-long-random-password' \
   -e LG_COOKIE_SECURE=false \
-  -e LG_API_ALLOWED_HOSTS='link42.example.com' \
   -v "$PWD/runtime/data:/app/data" \
   -v "$PWD/runtime/config:/app/config" \
   pmman/link42-lg:latest
@@ -145,7 +143,6 @@ services:
     environment:
       LG_ADMIN_PASSWORD: "replace-with-a-long-random-password"
       LG_COOKIE_SECURE: "auto"
-      LG_API_ALLOWED_HOSTS: "link42.example.com"
       LG_NODE_CONCURRENCY_LIMIT: "2"
       LG_DATA_DIR: "/app/data"
       LG_CONFIG_DIR: "/app/config"
@@ -236,7 +233,7 @@ image: pmman/link42-lg:<VERSION>
 - 运行时挂载了 `/app/data`。
 - 运行时挂载了 `/app/config`。
 - 已设置长度至少 8 位的 `LG_ADMIN_PASSWORD`。
-- 生产环境已配置 `LG_API_ALLOWED_HOSTS`。
+- 已确认 API 地址正确；管理员账号和部署侧出站网络访问受到适当保护。
 - 生产 HTTPS 环境保持 `LG_COOKIE_SECURE=auto` 或设置为 `true`。
 - `FORWARDED_ALLOW_IPS` 只包含实际反向代理地址，且未使用 `*`。
 - CDN 使用 Full 或 Full strict HTTPS 模式。

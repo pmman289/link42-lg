@@ -13,7 +13,7 @@
 | 路由、诊断目标和协议名由后端校验 | 已修复并验证 | Pydantic/IP 地址、域名、资源 ID 和协议名校验；命令注入样例返回 422 |
 | 协议自动加载和刷新按钮传递正确节点 | 已修复 | 自动加载与手动刷新都显式传入 `activeNode`，不会把浏览器事件误判为离线节点 |
 | 保存失败和异步查询失败可见 | 已修复 | 设置保存保留草稿并显示结构化错误；route、协议、详情和来源 AS 对 `failed/expired/cancelled` 展示安全错误，不会静默成空输出 |
-| API Base 主机锁定，来源变化时不复用旧 Token | 已修复并验证 | `pinned_api_host` 持久化；清空地址后切换主机被拒绝；HTTP 仅记录启动警告，允许 DN42 私网 |
+| API 来源变化时不复用旧 Token | 已修复并验证 | 更换主机、协议或端口后清除旧 Token，除非管理员显式填写新 Token；HTTP 仅记录警告，允许 DN42 私网 |
 | 公开节点字段最小化，查询访问凭证隔离 | 已修复并验证 | 匿名节点白名单字段；查询绑定 `lg_query_client`；管理员和访客访问范围分离 |
 | 代理上游网络、超时、非 JSON 和错误响应统一脱敏 | 已修复并验证 | 代理返回结构化 502/504；不把 Bearer Token 或上游正文写入日志 |
 | 隐藏协议的公开语义 | 已修复并验证 | 采用全站策略 B：访客协议列表、详情和路由候选均移除黑名单协议；管理员保留完整结果 |
@@ -42,6 +42,7 @@
 | liveness 健康检查 | 已修复并验证 | `/healthz` 和 Docker `HEALTHCHECK`；不依赖上游可用性，避免暂时故障反复重启 |
 | 容器 root 运行 | 产品决策接受 | 按部署要求保留 root；宿主机卷权限仍需运维核对 |
 | 私网、回环和 DN42 API 目标 | 产品决策接受 | 按需求允许；API Base 使用 HTTP 时启动日志告警，生产应通过可信网络和反向代理保护 Token |
+| API 地址不限制域名或首次主机 | 产品决策接受 | 按需求移除域名白名单和主机锁定；仅管理员可以配置，保留地址格式校验和来源变化时旧 Token 隔离；部署侧按需限制出站访问 |
 | 反向代理转发头 | 待真实部署验证 | `FORWARDED_ALLOW_IPS` 必须设置为准确代理 IP/网段，禁止 `*` |
 | API Token 存储与备份权限 | 待真实部署验证 | Token 仍保存在 SQLite；限制数据卷和备份权限，并制定轮换流程 |
 | 前端依赖和持续集成 | 已补齐基础门禁 | `npm audit`（含 dev 构建链）当前为 0；新增后端 unittest、前端构建、依赖审计和 Docker 构建 GitHub Actions；镜像扫描仍需平台配置 |
@@ -50,9 +51,10 @@
 
 - `python3 -m py_compile backend/main.py`
 - `npm ci`、`npm run build`、`git diff --check`
-- `python -m unittest discover -s tests -v`（15 项）
+- `python -m unittest discover -s tests -v`（20 项）
 - `npm audit`（含 dev 依赖，0 vulnerabilities）
 - Docker 多阶段镜像构建成功，Python 依赖安装和前端构建成功
-- Docker 接口回归：健康检查、API 404、节点公开字段、查询轮询、ASN 查询、登录限流、请求体/参数校验、访客槽位公平性、API 主机锁和 HTTP 警告
+- Docker 接口回归：健康检查、API 404、节点公开字段、查询轮询、ASN 查询、登录限流、请求体/参数校验、访客槽位公平性和 HTTP 警告
+- API 配置回归：管理员可直接更换域名和私网地址，旧主机锁与白名单不生效；非法 URL 和未登录修改仍被拒绝，来源变化不沿用旧 Token
 
 真实上线前应在 staging 核对 Link42 的节点 cursor、异步查询终态、`deadline_at` 单位、错误结构以及反向代理的 HTTPS/Cookie 行为。
