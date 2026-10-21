@@ -7,7 +7,9 @@
 | 项目 | 状态 | 证据 |
 | --- | --- | --- |
 | 管理员密码不再使用默认值，启动时强制要求至少 8 位 | 已修复并验证 | `backend/main.py` 的 `load_admin_password()`；Docker 中缺失或空密码以非零状态退出 |
-| Starlette 升级到不受报告漏洞影响的版本 | 已修复并验证 | `requirements.txt` 固定 `starlette==1.3.1`；Docker 构建通过 |
+| Starlette 升级到不受报告漏洞影响的版本 | 已修复并验证 | `requirements.txt` 固定 `starlette==1.9.0`；Docker 构建通过 |
+| 前端构建依赖高危更新 | 已修复并验证 | Vite 升级到 `8.3.5`，`@vitejs/plugin-react` 升级到 `6.1.2`，`source-map-js` 升级到 `1.2.2`；`npm audit --audit-level=high` 无漏洞 |
+| Python Web 栈安全维护更新 | 已修复并验证 | FastAPI `0.158.0`、Starlette `1.9.0`、Uvicorn `0.54.0`；`pip-audit` 无漏洞，httpx `0.28.1` 已为最新 |
 | 登录失败限流和退避 | 已修复并验证 | SQLite 记录失败次数；第 5 次失败后返回 429 和 `Retry-After` |
 | 公开代理接口总限流和请求体上限 | 已修复 | 所有 `/api/*` 经过访客级固定窗口限流，分类接口有更细阈值；请求体默认上限 1 MiB 并返回 413 |
 | 路由、诊断目标和协议名由后端校验 | 已修复并验证 | Pydantic/IP 地址、域名、资源 ID 和协议名校验；命令注入样例返回 422 |

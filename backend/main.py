@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import ipaddress
+import mimetypes
 import re
 import secrets
 import sqlite3
@@ -16,8 +17,7 @@ from urllib.parse import urlencode, urlsplit, urlunsplit
 
 import httpx
 from fastapi import Cookie, FastAPI, HTTPException, Request, Response
-from fastapi.responses import FileResponse, JSONResponse
-from fastapi.staticfiles import StaticFiles
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, field_validator
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -361,6 +361,14 @@ def warn_if_insecure_api_base(value: str) -> None:
             "Looking Glass API Base for host %s uses unencrypted HTTP; the Bearer Token will be sent in plaintext",
             parsed.hostname,
         )
+
+
+def static_file_response(path: Path, *, cache_control: str) -> Response:
+    return Response(
+        content=path.read_bytes(),
+        media_type=mimetypes.guess_type(path.name)[0] or "application/octet-stream",
+        headers={"Cache-Control": cache_control},
+    )
 
 
 async def validate_api_base(value: str, *, allow_empty: bool = False) -> str:
@@ -1297,15 +1305,22 @@ async def unknown_api(path: str):
     raise HTTPException(status_code=404, detail={"code": "not_found", "message": "API endpoint not found"})
 
 
-if DIST_DIR.exists():
-    app.mount("/assets", StaticFiles(directory=DIST_DIR / "assets"), name="assets")
+ASSET_DIR = (DIST_DIR / "assets").resolve()
+
+
+@app.get("/assets/{asset_path:path}", include_in_schema=False)
+async def asset(asset_path: str):
+    candidate = (ASSET_DIR / asset_path).resolve()
+    if not candidate.is_relative_to(ASSET_DIR) or not candidate.is_file():
+        raise HTTPException(status_code=404, detail="Asset not found")
+    return static_file_response(candidate, cache_control="public, max-age=31536000, immutable")
 
 
 @app.get("/favicon.svg")
 async def favicon():
     icon = DIST_DIR / "favicon.svg"
     if icon.exists():
-        return FileResponse(icon)
+        return static_file_response(icon, cache_control="public, max-age=86400")
     raise HTTPException(status_code=404, detail="favicon not found")
 
 
@@ -1320,5 +1335,5 @@ async def disabled_api_documentation():
 async def frontend(path: str):
     index = DIST_DIR / "index.html"
     if index.exists():
-        return FileResponse(index, headers={"Cache-Control": "no-cache"})
+        return static_file_response(index, cache_control="no-cache")
     raise HTTPException(status_code=404, detail="Frontend is not built. Run npm run build.")

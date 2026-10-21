@@ -230,6 +230,8 @@ docs/docker-hub-release.md
 
 ## 安全提示
 
+当前发布版本为 `0.1.2`。前端构建依赖使用 Vite `8.3.5`，Python Web 栈使用 FastAPI `0.158.0`、Starlette `1.9.0` 和 Uvicorn `0.54.0`；npm audit 与 pip-audit 均通过。Docker 构建阶段使用 Node 24 Alpine，运行时使用 Python 3.12 slim。
+
 - 必须设置强随机 `LG_ADMIN_PASSWORD`，未设置时应用不会启动。
 - API Base 使用 HTTP 时 Token 会明文传输；公网部署应优先使用 HTTPS。管理员可配置任意合法 HTTP(S) API 地址，请保护管理员账号，并按需在部署侧限制出站访问。
 - 使用 HTTPS 和反向代理时保持 `LG_COOKIE_SECURE=auto`，并准确配置 `FORWARDED_ALLOW_IPS`。

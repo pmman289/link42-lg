@@ -248,6 +248,23 @@ class BackendTest(unittest.TestCase):
         finally:
             self.main.save_settings(original)
 
+    def test_frontend_static_responses_are_bounded_to_dist(self):
+        asset = next(self.main.ASSET_DIR.glob("*.js"), None)
+        self.assertIsNotNone(asset)
+        with TestClient(self.main.app) as client:
+            index = client.get("/")
+            self.assertEqual(index.status_code, 200)
+            self.assertEqual(index.headers["cache-control"], "no-cache")
+            self.assertIn(asset.name, index.text)
+
+            script = client.get(f"/assets/{asset.name}")
+            self.assertEqual(script.status_code, 200)
+            self.assertIn("immutable", script.headers["cache-control"])
+            self.assertIn("javascript", script.headers["content-type"])
+
+            traversal = client.get("/assets/%2e%2e/backend/main.py")
+            self.assertEqual(traversal.status_code, 404)
+
     def test_query_slots_limit_each_owner_and_allow_second_visitor(self):
         owner_a = self.main.query_owner_hash("visitor-a")
         owner_b = self.main.query_owner_hash("visitor-b")
